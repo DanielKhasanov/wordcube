@@ -1,48 +1,52 @@
 // Package solver provides functionality to solve word puzzles using backtracking search.
 package solver
 
-import (
-	"math/rand"
-)
+type ID int32
 
-// Value interface defines the methods that a value should implement.
-type Value interface {
-	Evaluate() float64
+func (id ID) Int() int {
+	return int(id)
 }
 
-// Game interface defines the methods that a game should implement.
-type Game interface {
-	LegalActions() []Action
-	Value() Value
+type Node[T any] interface {
+	// Children returns a list of child nodes of type T.
+	Children() []T
+	// Id returns the unique identifier of the node.
+	Id() ID
+	// Terminal returns true if the node is a terminal node.
+	Terminal() bool
 }
 
-// Action interface defines the methods that an action should implement.
-type Action interface {
-	Apply(g Game) NodeSelector
+// Solver struct with a cache map and a mutex
+type Solver[T Node[T]] struct {
+	cache    map[ID]map[ID]T
+	visiting map[ID]bool
 }
 
-// NodeSelector represents a class that can select a random action according to their probabilities.
-type NodeSelector struct {
-	probabilityMap map[Game]float64
+// NewMemoize initializes the cache
+func New[T Node[T]]() *Solver[T] {
+	return &Solver[T]{cache: make(map[ID]map[ID]T), visiting: make(map[ID]bool)}
 }
 
-// NewNodeSelector creates a new NodeSelector.
-func NewNodeSelector(probabilityMap map[Game]float64) *NodeSelector {
-	return &NodeSelector{probabilityMap: probabilityMap}
-}
-
-// SelectRandom selects a random game state according to their probabilities.
-func (ns *NodeSelector) SelectRandom() Game {
-	total := 0.0
-	for _, prob := range ns.probabilityMap {
-		total += prob
+// CollectTerminals returns a list of terminal nodes in the tree rooted at the given node.
+func (s *Solver[T]) CollectTerminals(node T) map[ID]T {
+	if result, found := s.cache[node.Id()]; found {
+		return result
 	}
-	r := rand.Float64() * total
-	for game, prob := range ns.probabilityMap {
-		r -= prob
-		if r <= 0 {
-			return game
+	var terminals map[ID]T = make(map[ID]T)
+	if node.Terminal() {
+		terminals[node.Id()] = node
+	} else {
+		s.visiting[node.Id()] = true
+		for _, child := range node.Children() {
+			if _, visiting := s.visiting[child.Id()]; visiting {
+				continue
+			}
+			ct := s.CollectTerminals(child)
+			for id, terminal := range ct {
+				terminals[id] = terminal
+			}
 		}
 	}
-	return nil // Should not reach here if probabilities are correctly normalized
+	s.cache[node.Id()] = terminals
+	return terminals
 }
