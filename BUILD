@@ -1,6 +1,6 @@
 load("@bazel_gazelle//:def.bzl", "gazelle")
 
-# gazelle:prefix github.com/dkhasanov/games/wordcube
+# gazelle:prefix github.com/danielkhasanov/wordcube
 gazelle(name = "gazelle")
 
 gazelle(
