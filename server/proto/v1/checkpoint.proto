@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package proto.v1;
+
+option go_package = "github.com/danielkhasanov/wordcube/proto";
+
+message Dictionary {
+  repeated string word = 1;
+}
+
+message Square {
+  repeated int32 word = 1;
+}
+
+message Checkpoint {
+  Dictionary dictionary = 1;
+  Square start = 2;
+  Square end = 3;
+  Square current = 4;
+  int32 current_row = 5;
+}
+
+message SolutionSet {
+  Dictionary dictionary = 1;
+  repeated Square solutions = 2;
+}

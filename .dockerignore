@@ -1,0 +1,34 @@
+# Git files
+.git
+.gitignore
+
+# Node.js
+site/node_modules
+site/dist
+site/.vite
+
+# Go build artifacts
+server/main
+server/server
+
+# Development files
+**/.DS_Store
+**/*.log
+
+# IDE files
+.vscode
+.idea
+
+# Documentation
+*.md
+!README.md
+
+# Test files
+**/*_test.go
+**/testdata
+
+# Scratch files
+server/scratch
+
+# Build artifacts
+server/solver/test_graphs

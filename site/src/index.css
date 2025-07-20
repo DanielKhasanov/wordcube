@@ -1,0 +1,10 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --muted: 0 0% 96.1%;
+  --muted-foreground: 0 0% 45.1%;
+  --ring: 0 0% 3.9%;
+  --radius: 0.5rem;
+}

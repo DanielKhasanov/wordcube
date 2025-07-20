@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  wordcube:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "1323:1323"
+    environment:
+      - PORT=1323
+    restart: unless-stopped
