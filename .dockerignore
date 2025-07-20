@@ -1,6 +1,7 @@
 # Git files
 .git
 .gitignore
+**/.git
 
 # Node.js
 site/node_modules
