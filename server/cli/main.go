@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -161,7 +162,16 @@ func search() {
 	}
 	searcher := psolve.NewSearcher(ss)
 	fmt.Printf("Searching for matching solutions in the game state...\n")
-	solutions := searcher.FindMatchingSolutions(gameState)
+	ctx := context.Background()
+	solutionsChan, err := searcher.FindMatchingSolutions(ctx, gameState)
+	if err != nil {
+		fmt.Printf("error finding matching solutions: %v\n", err)
+		return
+	}
+	solutions := []int{}
+	for solutionIdx := range solutionsChan {
+		solutions = append(solutions, solutionIdx)
+	}
 	fmt.Printf("Found %d matching solutions\n", len(solutions))
 	outputPath := fmt.Sprintf("%s/matching_solutions.txt", *outputDir)
 	fmt.Printf("Writing matching solutions to %s\n", outputPath)

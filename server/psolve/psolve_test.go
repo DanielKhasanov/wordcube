@@ -10,7 +10,7 @@ import (
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/testing/protocmp"
 
-	cpb "github.com/danielkhasanov/wordcube/gen/v1"
+	cpb "github.com/danielkhasanov/wordcube/gen/proto/v1"
 )
 
 func mustReadCheckpoint(t *testing.T, path string) *cpb.Checkpoint {

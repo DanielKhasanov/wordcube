@@ -4,7 +4,6 @@
 
 echo "Building WordCube application..."
 
-# Build the Docker image
 docker build -t wordcube:latest .
 
 if [ $? -eq 0 ]; then

@@ -74,22 +74,6 @@ func main() {
 		}
 	})
 
-	// Solutions endpoint for word squares - supports both GET and POST
-	e.GET("/solutions", func(c echo.Context) error {
-		if !searcherReady {
-			return echo.NewHTTPError(http.StatusServiceUnavailable, "Solutions are still being loaded. Please try again in a moment.")
-		}
-		// Default board state for GET requests
-		boardState := [][]rune{
-			{0, 0, 0, 0, 0},
-			{0, 0, 0, 0, 0},
-			{0, 0, 0, 0, 0},
-			{0, 0, 0, 0, 0},
-			{0, 0, 0, 0, 0},
-		}
-		return streamSolutions(c, boardState, 10000)
-	})
-
 	e.POST("/solutions", func(c echo.Context) error {
 		if !searcherReady {
 			return echo.NewHTTPError(http.StatusServiceUnavailable, "Solutions are still being loaded. Please try again in a moment.")
@@ -107,7 +91,7 @@ func main() {
 				return echo.NewHTTPError(http.StatusBadRequest, "Board must be 5x5")
 			}
 		}
-		return streamSolutions(c, stringToRuneBoard(req.Board), 10000)
+		return streamSolutions(c, stringToRuneBoard(req.Board), 1000)
 	})
 
 	// Status endpoint to check if searcher is ready
