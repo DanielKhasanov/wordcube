@@ -307,7 +307,7 @@ func (s *State) Next() bool {
 		proposedWordIndex = s.rowWordIndexes.At(s.currentRow) + 1
 		replace = true
 	}
-	for true {
+	for {
 		// The proposed index is out of bounds, so we must backtrack.
 		for proposedWordIndex >= len(s.validWords) {
 			// Backtracking in replacement mode means removing the current row.
@@ -335,16 +335,15 @@ func (s *State) Next() bool {
 		// Pruning optimization #2. Skip to the first word that doesn't share the shortest row prefix that invalidates the column.
 		proposedWordIndex = s.prefixSkipList[proposedWordIndex][noWordsPrefixIndex]
 	}
-	return false
 }
 
 func (s *State) CollectTerminals(c chan *cpb.Square) {
-	for true {
+	for {
 		if s.Terminal() {
 			c <- s.ToSolution()
 		}
 		if !s.Next() {
-			break
+			return
 		}
 	}
 }

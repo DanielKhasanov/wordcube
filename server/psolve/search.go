@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"slices"
-	"sync/atomic"
 	"time"
 
 	cpb "github.com/danielkhasanov/wordcube/gen/proto/v1"
@@ -150,18 +149,6 @@ func (s *Searcher) solutionInSets(solution int, solutionSets []SolutionSet) bool
 		}
 	}
 	return true // Solution is in all sets.
-}
-
-var counter int64 // Global counter for the event
-
-func logEveryN(n int, message string) {
-	// Atomically increment the counter to ensure thread safety
-	currentCount := atomic.AddInt64(&counter, 1)
-
-	// Check if the current count is a multiple of N
-	if currentCount%int64(n) == 0 {
-		log.Printf("Logged every %d: %s (count: %d)", n, message, currentCount)
-	}
 }
 
 // noCopyIntersection streams the intersection of solutionSets without copying the solutions.
