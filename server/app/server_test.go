@@ -426,6 +426,92 @@ func TestSolutionsHandler_RateLimitIgnoresSpoofedForwardedForHeader(t *testing.T
 	}
 }
 
+func TestSolutionsHandler_TrustProxyHeadersHonorsXFFFromTrustedProxy(t *testing.T) {
+	resetSearcherState(t)
+	searcher = newFixtureSearcher()
+	searcherReady = true
+	t.Setenv("RATE_LIMIT_RPS", "1")
+	t.Setenv("RATE_LIMIT_BURST", "1")
+	t.Setenv("TRUST_PROXY_HEADERS", "true")
+	e := newEcho()
+
+	newReq := func(xff string) *http.Request {
+		body := strings.NewReader(`{"board":[["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"]]}`)
+		req := httptest.NewRequest(http.MethodPost, "/solutions", body)
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		req.Header.Set(echo.HeaderXForwardedFor, xff)
+		// The direct TCP peer is loopback, standing in for a trusted reverse
+		// proxy running on the same host/private network - echo.ExtractIPFromXFFHeader
+		// only honors X-Forwarded-For when the immediate peer is itself
+		// trusted (loopback/link-local/private-net by default), so this is
+		// what makes the opt-in actually take the XFF branch below.
+		req.RemoteAddr = "127.0.0.1:1234"
+		return req
+	}
+
+	rec1 := httptest.NewRecorder()
+	e.ServeHTTP(rec1, newReq("9.9.9.9"))
+	if rec1.Code == http.StatusTooManyRequests {
+		t.Fatalf("first request unexpectedly rate limited (status %d)", rec1.Code)
+	}
+
+	// Same downstream client IP relayed via X-Forwarded-For, through the same
+	// trusted proxy: should share the first request's bucket and be denied.
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, newReq("9.9.9.9"))
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request from same X-Forwarded-For client status = %d, want %d (TRUST_PROXY_HEADERS=true should key off the XFF client IP)", rec2.Code, http.StatusTooManyRequests)
+	}
+
+	// A different downstream client IP via the same trusted proxy is a
+	// distinct bucket and must not be limited by the first client's burst.
+	rec3 := httptest.NewRecorder()
+	e.ServeHTTP(rec3, newReq("8.8.8.8"))
+	if rec3.Code == http.StatusTooManyRequests {
+		t.Fatalf("request from a different X-Forwarded-For client unexpectedly rate limited (status %d)", rec3.Code)
+	}
+}
+
+func TestSolutionsHandler_TrustProxyHeadersIgnoresXFFFromUntrustedRemoteAddr(t *testing.T) {
+	resetSearcherState(t)
+	searcher = newFixtureSearcher()
+	searcherReady = true
+	t.Setenv("RATE_LIMIT_RPS", "1")
+	t.Setenv("RATE_LIMIT_BURST", "1")
+	t.Setenv("TRUST_PROXY_HEADERS", "true")
+	e := newEcho()
+
+	newReq := func(xff string) *http.Request {
+		body := strings.NewReader(`{"board":[["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"]]}`)
+		req := httptest.NewRequest(http.MethodPost, "/solutions", body)
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		req.Header.Set(echo.HeaderXForwardedFor, xff)
+		// A public, non-private direct peer: even with TRUST_PROXY_HEADERS=true,
+		// echo.ExtractIPFromXFFHeader only trusts X-Forwarded-For when the
+		// immediate connection is itself loopback/link-local/private-net, so
+		// this simulates a client talking directly to the app (or through an
+		// untrusted intermediary) rather than a real deployed reverse proxy.
+		req.RemoteAddr = "203.0.113.9:1234"
+		return req
+	}
+
+	rec1 := httptest.NewRecorder()
+	e.ServeHTTP(rec1, newReq("1.1.1.1"))
+	if rec1.Code == http.StatusTooManyRequests {
+		t.Fatalf("first request unexpectedly rate limited (status %d)", rec1.Code)
+	}
+
+	// Different spoofed X-Forwarded-For, same untrusted direct peer: must
+	// still land in the same bucket (RemoteAddr fallback), proving
+	// TRUST_PROXY_HEADERS=true doesn't blindly trust XFF from any client -
+	// only from ones connecting through a recognized private/loopback peer.
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, newReq("2.2.2.2"))
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request with different X-Forwarded-For from an untrusted peer status = %d, want %d (untrusted direct peer must fall back to RemoteAddr, not the client-supplied header)", rec2.Code, http.StatusTooManyRequests)
+	}
+}
+
 func TestPanicRecovery(t *testing.T) {
 	resetSearcherState(t)
 	e := newEcho()
