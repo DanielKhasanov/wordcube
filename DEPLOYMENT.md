@@ -109,7 +109,7 @@ The Dockerfile uses a multi-stage build process:
    - Runs `npm run build` to create production assets
 
 2. **Stage 2**: Builds the Go server binary
-   - Uses Go 1.24
+   - Uses Go 1.25
    - Compiles the server from `server/app/server.go`
 
 3. **Stage 3**: Creates final lightweight Alpine Linux image
