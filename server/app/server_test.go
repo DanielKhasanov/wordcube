@@ -330,6 +330,34 @@ func TestSolutionsHandler_StreamsMatchingSolutionAsNDJSON(t *testing.T) {
 	}
 }
 
+// TestSolutionsHandler_SearchErrorReturns500NotSilent200 exercises the path
+// where the underlying search itself errors (as opposed to "zero solutions
+// match" - a query board can name a letter/position combination that has no
+// entry at all in the key index, which FindMatchingSolutions surfaces as an
+// error, not an empty result set). The handler must report that as a 500,
+// not a 200 with an empty body, since streamSolutions previously wrote the
+// 200 status header before calling FindMatchingSolutions - by the time the
+// error was known, the response was already committed and the real error
+// was silently swallowed into what looked like a successful empty result.
+func TestSolutionsHandler_SearchErrorReturns500NotSilent200(t *testing.T) {
+	resetSearcherState(t)
+	searcherState.Store(newFixtureSearcher())
+	e := newEcho()
+
+	// "z" never appears in the fixture dictionary, so this key has no entry
+	// in the index at all (distinct from a key that exists but whose value
+	// set doesn't intersect with anything).
+	body := strings.NewReader(`{"board":[["z","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"]]}`)
+	req := httptest.NewRequest(http.MethodPost, "/solutions", body)
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status code = %d, want %d (body = %q)", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	}
+}
+
 func TestSolutionsHandler_RateLimited(t *testing.T) {
 	resetSearcherState(t)
 	searcherState.Store(newFixtureSearcher())

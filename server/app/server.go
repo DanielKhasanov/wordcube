@@ -357,8 +357,6 @@ func stringToRuneBoard(board [][]string) [][]rune {
 }
 
 func streamSolutions(c echo.Context, s *psolve.Searcher, boardState [][]rune, limit int) error {
-	c.Response().Header().Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
-	c.Response().WriteHeader(http.StatusOK)
 	// Generate solutions based on board state
 	ctx, cancel := context.WithTimeout(c.Request().Context(), time.Second*2)
 	defer cancel()
@@ -367,6 +365,13 @@ func streamSolutions(c echo.Context, s *psolve.Searcher, boardState [][]rune, li
 		fmt.Printf("Failed to find solutions: %v\n", err)
 		return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to find solutions: %v", err))
 	}
+	// Only commit the response (and thus the 200 status) once the search
+	// has actually started successfully - writing the header before this
+	// point would commit a 200 before an error from FindMatchingSolutions
+	// is known, silently downgrading a real failure into what looks like a
+	// successful empty result to the client.
+	c.Response().Header().Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	c.Response().WriteHeader(http.StatusOK)
 	enc := json.NewEncoder(c.Response())
 	i := 0
 	for solutionIdx := range solutionChan {
