@@ -4,6 +4,13 @@ import { Solution } from '../types/api';
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 const SOLUTIONS_ENDPOINT = `${API_BASE_URL}/solutions`;
 
+// The backend loads and indexes its multi-million-row solution set in a
+// background goroutine at startup (see GET /status) and returns 503 from
+// /solutions until that finishes - a normal, expected window (observed to
+// last several seconds against the real solutions.textpb), not a failure.
+// Retry after a short delay instead of surfacing it as an error.
+const NOT_READY_RETRY_DELAY_MS = 1000;
+
 export function useSolutions(board?: string[][]) {
   const [solutions, setSolutions] = useState<Solution[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -11,12 +18,10 @@ export function useSolutions(board?: string[][]) {
 
   useEffect(() => {
     const controller = new AbortController();
+    let retryTimeout: ReturnType<typeof setTimeout> | undefined;
 
     const fetchSolutions = async () => {
-      setIsLoading(true);
-      setError(null);
-      setSolutions([]);
-
+      let retrying = false;
       try {
         const requestBody = {
           board: board || Array(5).fill(null).map(() => Array(5).fill(''))
@@ -30,6 +35,12 @@ export function useSolutions(board?: string[][]) {
           body: JSON.stringify(requestBody),
           signal: controller.signal,
         });
+
+        if (response.status === 503) {
+          retrying = true;
+          retryTimeout = setTimeout(fetchSolutions, NOT_READY_RETRY_DELAY_MS);
+          return;
+        }
 
         if (!response.ok) {
           throw new Error('Failed to fetch solutions');
@@ -78,16 +89,20 @@ export function useSolutions(board?: string[][]) {
         }
         setError(err instanceof Error ? err : new Error('Unknown error'));
       } finally {
-        if (!controller.signal.aborted) {
+        if (!retrying && !controller.signal.aborted) {
           setIsLoading(false);
         }
       }
     };
 
+    setIsLoading(true);
+    setError(null);
+    setSolutions([]);
     fetchSolutions();
 
     return () => {
       controller.abort();
+      clearTimeout(retryTimeout);
     };
   }, [board]); // Add board as dependency
 

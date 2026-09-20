@@ -62,8 +62,31 @@ describe('useSolutions', () => {
     expect(result.current.data).toEqual([{ id: 1, grid: [['a']] }]);
   });
 
+  it('retries without surfacing an error when the server responds 503 (still loading)', async () => {
+    const solutions: Solution[] = [{ id: 1, grid: [['a']] }];
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockResolvedValueOnce(
+        new Response(ndjsonStream(solutions.map(jsonLine)), { status: 200 })
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { result } = renderHook(() => useSolutions());
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(result.current.isLoading).toBe(true);
+    expect(result.current.error).toBeNull();
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2), { timeout: 3000 });
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(result.current.error).toBeNull();
+    expect(result.current.data).toEqual(solutions);
+  });
+
   it('surfaces an error when the server responds with a non-ok status', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 503 }));
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 500 }));
     vi.stubGlobal('fetch', fetchMock);
 
     const { result } = renderHook(() => useSolutions());
