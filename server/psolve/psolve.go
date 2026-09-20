@@ -70,7 +70,7 @@ func (i Indexes) Values() iter.Seq[int] {
 type State struct {
 	size          int
 	validWords    [][]rune
-	verticalTries []*trie.Walker
+	verticalTries []trie.Walker
 	// rowWordIndexes[i] = j -> The word at row i is validWords[j]. i > currentRow -> j = 0.
 	rowWordIndexes Indexes
 	// index of largest populated row.

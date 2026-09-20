@@ -151,8 +151,8 @@ type Walker struct {
 }
 
 // NewWalker returns a Walker positioned at the root of the Trie.
-func (t *Trie) NewWalker() *Walker {
-	return &Walker{walkedNode: t.root}
+func (t *Trie) NewWalker() Walker {
+	return Walker{walkedNode: t.root}
 }
 
 func (w *Walker) WalkIn(r rune) bool {
