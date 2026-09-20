@@ -227,6 +227,59 @@ func TestSolutionsHandler_StreamsMatchingSolutionAsNDJSON(t *testing.T) {
 	}
 }
 
+func TestSolutionsHandler_RateLimited(t *testing.T) {
+	resetSearcherState(t)
+	// searcherReady must not be set true without a real searcher: statusHandler
+	// dereferences the global searcher once ready, so a nil searcher here would
+	// panic (Recover would mask it as an unrelated 500 in the assertions below).
+	searcher = newFixtureSearcher()
+	searcherReady = true
+	// Burst of 1 and a very low refill rate means the second request from
+	// the same client IP within the test's lifetime must be denied.
+	t.Setenv("RATE_LIMIT_RPS", "1")
+	t.Setenv("RATE_LIMIT_BURST", "1")
+	e := newEcho()
+
+	newReq := func() *http.Request {
+		body := strings.NewReader(`{"board":[["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"]]}`)
+		req := httptest.NewRequest(http.MethodPost, "/solutions", body)
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		return req
+	}
+
+	rec1 := httptest.NewRecorder()
+	e.ServeHTTP(rec1, newReq())
+	if rec1.Code == http.StatusTooManyRequests {
+		t.Fatalf("first request unexpectedly rate limited (status %d)", rec1.Code)
+	}
+
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, newReq())
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request status = %d, want %d (burst=1 should reject an immediate second request)", rec2.Code, http.StatusTooManyRequests)
+	}
+
+	// A request from a different client IP is a distinct rate-limit bucket
+	// and should not be affected by the first client's burst.
+	rec3 := httptest.NewRecorder()
+	req3 := newReq()
+	req3.RemoteAddr = "203.0.113.5:1234"
+	e.ServeHTTP(rec3, req3)
+	if rec3.Code == http.StatusTooManyRequests {
+		t.Fatalf("request from a different IP unexpectedly rate limited (status %d)", rec3.Code)
+	}
+
+	// /status is not rate limited by the /solutions-specific middleware.
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/status", nil)
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		if rec.Code == http.StatusTooManyRequests {
+			t.Fatalf("/status unexpectedly rate limited on request %d", i)
+		}
+	}
+}
+
 func TestPanicRecovery(t *testing.T) {
 	resetSearcherState(t)
 	e := newEcho()

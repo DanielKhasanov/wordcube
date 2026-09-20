@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/danielkhasanov/wordcube/reader"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -23,6 +25,13 @@ const (
 	readTimeout       = 10 * time.Second
 	writeTimeout      = 30 * time.Second
 	idleTimeout       = 120 * time.Second
+
+	// defaultSolutionsRateLimit and defaultSolutionsRateBurst bound how
+	// often a single client IP may hit the expensive /solutions search
+	// endpoint (each request walks the inverted index and streams
+	// results), guarding against accidental or malicious hammering.
+	defaultSolutionsRateLimit = 5
+	defaultSolutionsRateBurst = 10
 )
 
 type (
@@ -70,6 +79,34 @@ func allowedOrigins() []string {
 	return []string{"*"}
 }
 
+// solutionsRateLimiterMiddleware rate limits POST /solutions per client IP
+// using a token-bucket algorithm (golang.org/x/time/rate, via Echo's
+// RateLimiterMemoryStore), since each request runs a real search against
+// the in-memory index rather than serving static/cheap content. Limits are
+// configurable via RATE_LIMIT_RPS/RATE_LIMIT_BURST for operators who need to
+// tune them, defaulting to a conservative per-IP allowance.
+func solutionsRateLimiterMiddleware() echo.MiddlewareFunc {
+	rps := defaultSolutionsRateLimit
+	if v := os.Getenv("RATE_LIMIT_RPS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			rps = parsed
+		}
+	}
+	burst := defaultSolutionsRateBurst
+	if v := os.Getenv("RATE_LIMIT_BURST"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			burst = parsed
+		}
+	}
+	store := middleware.NewRateLimiterMemoryStoreWithConfig(middleware.RateLimiterMemoryStoreConfig{
+		Rate:  rate.Limit(rps),
+		Burst: burst,
+	})
+	return middleware.RateLimiterWithConfig(middleware.RateLimiterConfig{
+		Store: store,
+	})
+}
+
 // newEcho builds the Echo instance with all middleware and routes
 // registered, without starting a listener. This keeps route/middleware
 // wiring independently testable via httptest.
@@ -96,7 +133,7 @@ func newEcho() *echo.Echo {
 	// request body well above that to block oversized-payload abuse.
 	e.Use(middleware.BodyLimit("64K"))
 
-	e.POST("/solutions", solutionsHandler)
+	e.POST("/solutions", solutionsHandler, solutionsRateLimiterMiddleware())
 	e.GET("/status", statusHandler)
 
 	// Serve static files from the frontend build
