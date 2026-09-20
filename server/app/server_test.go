@@ -153,6 +153,107 @@ func TestCORSHeaders_Preflight(t *testing.T) {
 	}
 }
 
+// withEnv sets an env var for the duration of the test, restoring whatever
+// value (or absence) preceded it.
+func withEnv(t *testing.T, key, value string) {
+	t.Helper()
+	prev, hadPrev := os.LookupEnv(key)
+	t.Cleanup(func() {
+		if hadPrev {
+			os.Setenv(key, prev)
+		} else {
+			os.Unsetenv(key)
+		}
+	})
+	os.Setenv(key, value)
+}
+
+func TestAllowedOrigins(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		unset bool
+		want  []string
+	}{
+		{name: "unset defaults to wildcard", unset: true, want: []string{"*"}},
+		{name: "empty defaults to wildcard", value: "", want: []string{"*"}},
+		{name: "single origin", value: "https://example.com", want: []string{"https://example.com"}},
+		{
+			name:  "comma-separated list",
+			value: "https://a.example.com,https://b.example.com",
+			want:  []string{"https://a.example.com", "https://b.example.com"},
+		},
+		{
+			name:  "whitespace around entries is trimmed",
+			value: "https://a.example.com, https://b.example.com , https://c.example.com",
+			want:  []string{"https://a.example.com", "https://b.example.com", "https://c.example.com"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.unset {
+				prev, hadPrev := os.LookupEnv("ALLOWED_ORIGINS")
+				t.Cleanup(func() {
+					if hadPrev {
+						os.Setenv("ALLOWED_ORIGINS", prev)
+					} else {
+						os.Unsetenv("ALLOWED_ORIGINS")
+					}
+				})
+				os.Unsetenv("ALLOWED_ORIGINS")
+			} else {
+				withEnv(t, "ALLOWED_ORIGINS", tt.value)
+			}
+			got := allowedOrigins()
+			if len(got) != len(tt.want) {
+				t.Fatalf("allowedOrigins() = %#v, want %#v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("allowedOrigins() = %#v, want %#v", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+// TestCORSHeaders_RestrictedOriginAllowlist proves that setting
+// ALLOWED_ORIGINS actually changes the middleware's decision, not just its
+// configured value: a request from an allowed origin gets the CORS header
+// echoed back, while a request from an origin absent from the allowlist gets
+// no Access-Control-Allow-Origin header at all (which is how browsers learn
+// to block the cross-origin response). Every other CORS test in this file
+// only exercises the default "*" wildcard, so this was previously untested.
+func TestCORSHeaders_RestrictedOriginAllowlist(t *testing.T) {
+	resetSearcherState(t)
+	withEnv(t, "ALLOWED_ORIGINS", "https://allowed.example.com")
+	e := newEcho()
+
+	t.Run("allowed origin is echoed back", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodOptions, "/solutions", nil)
+		req.Header.Set("Origin", "https://allowed.example.com")
+		req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://allowed.example.com" {
+			t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, "https://allowed.example.com")
+		}
+	})
+
+	t.Run("disallowed origin gets no CORS header", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodOptions, "/solutions", nil)
+		req.Header.Set("Origin", "https://evil.example.com")
+		req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("Access-Control-Allow-Origin = %q, want empty (origin not in allowlist)", got)
+		}
+	})
+}
+
 func TestSecurityHeaders_Present(t *testing.T) {
 	resetSearcherState(t)
 	e := newEcho()

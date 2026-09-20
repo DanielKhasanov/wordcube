@@ -81,12 +81,20 @@ func initializeSearcher() error {
 // allowedOrigins returns the CORS origin allowlist. It defaults to "*" to
 // preserve existing behavior (the frontend may be served from an arbitrary
 // dev-environment URL), but operators can lock this down in production via
-// the ALLOWED_ORIGINS env var (comma-separated).
+// the ALLOWED_ORIGINS env var (comma-separated). Entries are trimmed so a
+// stray space after a comma (e.g. "https://a.com, https://b.com") doesn't
+// silently produce an origin string that will never match a real Origin
+// header, which would otherwise leave the second entry permanently unusable.
 func allowedOrigins() []string {
-	if v := os.Getenv("ALLOWED_ORIGINS"); v != "" {
-		return strings.Split(v, ",")
+	v := os.Getenv("ALLOWED_ORIGINS")
+	if v == "" {
+		return []string{"*"}
 	}
-	return []string{"*"}
+	origins := strings.Split(v, ",")
+	for i, o := range origins {
+		origins[i] = strings.TrimSpace(o)
+	}
+	return origins
 }
 
 // solutionsRateLimiterMiddleware rate limits POST /solutions per client IP
