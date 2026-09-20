@@ -173,7 +173,12 @@ func (s *Searcher) noCopyIntersection(ctx context.Context, solutionSets []Soluti
 				// continue processing.
 			}
 			if s.solutionInSets(solution, solutionSets[1:]) {
-				solutionChan <- solution
+				select {
+				case <-ctx.Done():
+					fmt.Printf("noCopyIntersection canceled: %v\n", ctx.Err())
+					return
+				case solutionChan <- solution:
+				}
 			}
 		}
 	}(ctx)
@@ -249,7 +254,12 @@ func (s *Searcher) filterSolutionsAbsolutely(ctx context.Context, solutions Solu
 			solutionSquare := s.ss.GetSolutions()[solution]
 			solutionGrid := gridFromProto(s.ss.GetDictionary(), solutionSquare)
 			if s.possibleMatch(solutionGrid, grid) {
-				c <- solution // Send solution if it matches the grid.
+				select {
+				case <-ctx.Done():
+					fmt.Printf("filterSolutionsAbsolutely canceled: %v\n", ctx.Err())
+					return
+				case c <- solution: // Send solution if it matches the grid.
+				}
 			}
 		}
 	}()

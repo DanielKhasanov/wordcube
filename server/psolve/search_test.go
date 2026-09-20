@@ -2,7 +2,9 @@ package psolve
 
 import (
 	"context"
+	"runtime"
 	"testing"
+	"time"
 
 	cpb "github.com/danielkhasanov/wordcube/gen/proto/v1"
 )
@@ -85,5 +87,64 @@ func TestFindMatchingSolutions_LetterUnknownToDictionaryReturnsNoError(t *testin
 	}
 	if len(got) != 0 {
 		t.Fatalf("solutions = %v, want none", got)
+	}
+}
+
+// newManySolutionsSearcher builds a Searcher with n duplicate 2x2 squares
+// (word 0 in row 0, word 1 in row 1), all matching the same single-letter
+// query key. This lets tests force the intersection/filter pipeline to
+// produce more matches than a channel's buffer size, so a consumer that
+// stops reading mid-stream can actually observe backpressure.
+func newManySolutionsSearcher(n int) *Searcher {
+	ss := &cpb.SolutionSet{
+		Dictionary: &cpb.Dictionary{Word: []string{"ax", "by"}},
+	}
+	for i := 0; i < n; i++ {
+		ss.Solutions = append(ss.Solutions, &cpb.Square{Word: []int32{0, 1}})
+	}
+	return NewSearcher(ss)
+}
+
+// TestFindMatchingSolutions_AbandonedConsumerDoesNotLeakGoroutines reproduces
+// a goroutine leak: when a caller cancels ctx and stops reading from the
+// returned SolutionChan (exactly what streamSolutions in server/app does
+// when a client disconnects mid-stream, or an encode/write to the response
+// fails), the pipeline's internal goroutines (noCopyIntersection and
+// filterSolutionsAbsolutely) should exit instead of blocking forever on a
+// channel send nobody will ever read.
+func TestFindMatchingSolutions_AbandonedConsumerDoesNotLeakGoroutines(t *testing.T) {
+	// More than the internal channels' buffer size (100) so the producer
+	// goroutines are guaranteed to still have unsent solutions once the
+	// buffer fills and the consumer stops reading.
+	s := newManySolutionsSearcher(500)
+	grid := [][]rune{{'a', 0}, {0, 0}}
+
+	before := runtime.NumGoroutine()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c, err := s.FindMatchingSolutions(ctx, grid)
+	if err != nil {
+		t.Fatalf("FindMatchingSolutions returned error: %v", err)
+	}
+	// Never read from c at all (like a client that disconnects before
+	// consuming any streamed result) and give the pipeline goroutines ample
+	// time to run all the way to filling both internal channels' buffers and
+	// blocking on a send, before abandoning the channel entirely.
+	_ = c
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		// Give the runtime a chance to schedule the leaked goroutines so
+		// NumGoroutine reflects their exit.
+		runtime.Gosched()
+		if runtime.NumGoroutine() <= before+1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutines leaked: before=%d, after=%d", before, runtime.NumGoroutine())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
