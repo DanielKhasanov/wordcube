@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,18 +34,15 @@ func newFixtureSearcher() *psolve.Searcher {
 }
 
 // resetSearcherState ensures tests don't leak global searcher state into
-// each other; searcher/searcherReady are process-wide globals set by
+// each other; searcherState is a process-wide atomic global set by
 // initializeSearcher in production.
 func resetSearcherState(t *testing.T) {
 	t.Helper()
-	prevReady := searcherReady
-	prevSearcher := searcher
+	prev := searcherState.Load()
 	t.Cleanup(func() {
-		searcherReady = prevReady
-		searcher = prevSearcher
+		searcherState.Store(prev)
 	})
-	searcherReady = false
-	searcher = nil
+	searcherState.Store(nil)
 }
 
 func TestStatusHandler_NotReady(t *testing.T) {
@@ -88,9 +86,8 @@ func TestSolutionsHandler_ServiceUnavailableWhenNotReady(t *testing.T) {
 func TestSolutionsHandler_RejectsMalformedBoard(t *testing.T) {
 	resetSearcherState(t)
 	// The handler checks readiness before validating the board shape, so
-	// mark the searcher ready (without a real searcher) to exercise the
-	// validation branch specifically.
-	searcherReady = true
+	// mark the searcher ready to exercise the validation branch specifically.
+	searcherState.Store(newFixtureSearcher())
 	e := newEcho()
 
 	tests := []struct {
@@ -119,7 +116,7 @@ func TestSolutionsHandler_RejectsMalformedBoard(t *testing.T) {
 
 func TestSolutionsHandler_BodyTooLarge(t *testing.T) {
 	resetSearcherState(t)
-	searcherReady = true
+	searcherState.Store(newFixtureSearcher())
 	e := newEcho()
 
 	// BodyLimit is set to 64K; send a payload well over that.
@@ -275,8 +272,7 @@ func TestSecurityHeaders_Present(t *testing.T) {
 
 func TestSolutionsHandler_StreamsMatchingSolutionAsNDJSON(t *testing.T) {
 	resetSearcherState(t)
-	searcher = newFixtureSearcher()
-	searcherReady = true
+	searcherState.Store(newFixtureSearcher())
 	e := newEcho()
 
 	// Only constrain the top-left cell; the fixture has exactly one
@@ -336,11 +332,7 @@ func TestSolutionsHandler_StreamsMatchingSolutionAsNDJSON(t *testing.T) {
 
 func TestSolutionsHandler_RateLimited(t *testing.T) {
 	resetSearcherState(t)
-	// searcherReady must not be set true without a real searcher: statusHandler
-	// dereferences the global searcher once ready, so a nil searcher here would
-	// panic (Recover would mask it as an unrelated 500 in the assertions below).
-	searcher = newFixtureSearcher()
-	searcherReady = true
+	searcherState.Store(newFixtureSearcher())
 	// Burst of 1 and a very low refill rate means the second request from
 	// the same client IP within the test's lifetime must be denied.
 	t.Setenv("RATE_LIMIT_RPS", "1")
@@ -389,8 +381,7 @@ func TestSolutionsHandler_RateLimited(t *testing.T) {
 
 func TestSolutionsHandler_RateLimitIgnoresSpoofedForwardedForHeader(t *testing.T) {
 	resetSearcherState(t)
-	searcher = newFixtureSearcher()
-	searcherReady = true
+	searcherState.Store(newFixtureSearcher())
 	t.Setenv("RATE_LIMIT_RPS", "1")
 	t.Setenv("RATE_LIMIT_BURST", "1")
 	// TRUST_PROXY_HEADERS is intentionally left unset: by default this app
@@ -428,8 +419,7 @@ func TestSolutionsHandler_RateLimitIgnoresSpoofedForwardedForHeader(t *testing.T
 
 func TestSolutionsHandler_TrustProxyHeadersHonorsXFFFromTrustedProxy(t *testing.T) {
 	resetSearcherState(t)
-	searcher = newFixtureSearcher()
-	searcherReady = true
+	searcherState.Store(newFixtureSearcher())
 	t.Setenv("RATE_LIMIT_RPS", "1")
 	t.Setenv("RATE_LIMIT_BURST", "1")
 	t.Setenv("TRUST_PROXY_HEADERS", "true")
@@ -474,8 +464,7 @@ func TestSolutionsHandler_TrustProxyHeadersHonorsXFFFromTrustedProxy(t *testing.
 
 func TestSolutionsHandler_TrustProxyHeadersIgnoresXFFFromUntrustedRemoteAddr(t *testing.T) {
 	resetSearcherState(t)
-	searcher = newFixtureSearcher()
-	searcherReady = true
+	searcherState.Store(newFixtureSearcher())
 	t.Setenv("RATE_LIMIT_RPS", "1")
 	t.Setenv("RATE_LIMIT_BURST", "1")
 	t.Setenv("TRUST_PROXY_HEADERS", "true")
@@ -717,4 +706,54 @@ func TestTLSConfig_AcceptsTLS12AndAbove(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestConcurrentReadinessPublishHasNoDataRace exercises the exact concurrency
+// shape production sees at startup: initializeSearcher publishes the
+// searcher from a background goroutine (main() launches it via `go func()`)
+// while HTTP handlers on other goroutines concurrently read readiness state
+// to serve /status and /solutions. Before searcherState became a single
+// atomic.Pointer, "searcher" and "searcherReady" were two independent
+// package-level globals with no synchronization between the writer goroutine
+// and reader goroutines - an unsynchronized concurrent read/write, i.e. a
+// data race under the Go memory model. This test only fails under `go test
+// -race`; it can't detect the race by asserting on response values, since a
+// race is a memory-model violation, not necessarily an observable output
+// difference on any given run.
+func TestConcurrentReadinessPublishHasNoDataRace(t *testing.T) {
+	resetSearcherState(t)
+	e := newEcho()
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	readerBody := `{"board":[["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"]]}`
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodGet, "/status", nil)
+				e.ServeHTTP(rec, req)
+
+				rec2 := httptest.NewRecorder()
+				req2 := httptest.NewRequest(http.MethodPost, "/solutions", strings.NewReader(readerBody))
+				req2.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+				e.ServeHTTP(rec2, req2)
+			}
+		}()
+	}
+
+	// Simulates initializeSearcher's background publish racing against the
+	// concurrent readers above.
+	searcherState.Store(newFixtureSearcher())
+
+	close(stop)
+	wg.Wait()
 }

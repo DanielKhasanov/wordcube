@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -55,12 +56,17 @@ type (
 	}
 )
 
-var (
-	// Global searcher for finding solutions
-	searcher *psolve.Searcher
-	// Flag to track if searcher is ready
-	searcherReady bool
-)
+// searcherState holds the current *psolve.Searcher, or nil while solutions
+// are still loading. It is set once by initializeSearcher's background
+// goroutine in main() and read concurrently by every /solutions and /status
+// request handler; a plain (searcher *psolve.Searcher, searcherReady bool)
+// pair of package globals here would be an unsynchronized concurrent
+// read/write - a data race under the Go memory model, and one where a
+// request could plausibly observe searcherReady=true before the searcher
+// write is visible. atomic.Pointer makes "ready" and "which searcher" a
+// single atomically-published value, so there's no window where one is
+// updated without the other.
+var searcherState atomic.Pointer[psolve.Searcher]
 
 // initializeSearcher loads solutions from textpb file and creates a searcher
 func initializeSearcher() error {
@@ -72,8 +78,7 @@ func initializeSearcher() error {
 		return fmt.Errorf("failed to load solutions: %v", err)
 	}
 
-	searcher = psolve.NewSearcher(solutionSet)
-	searcherReady = true
+	searcherState.Store(psolve.NewSearcher(solutionSet))
 	fmt.Printf("Searcher initialized with %d solutions\n", len(solutionSet.GetSolutions()))
 	return nil
 }
@@ -230,7 +235,8 @@ func newEcho() *echo.Echo {
 }
 
 func solutionsHandler(c echo.Context) error {
-	if !searcherReady {
+	s := searcherState.Load()
+	if s == nil {
 		return echo.NewHTTPError(http.StatusServiceUnavailable, "Solutions are still being loaded. Please try again in a moment.")
 	}
 	var req BoardRequest
@@ -246,16 +252,17 @@ func solutionsHandler(c echo.Context) error {
 			return echo.NewHTTPError(http.StatusBadRequest, "Board must be 5x5")
 		}
 	}
-	return streamSolutions(c, stringToRuneBoard(req.Board), 1000)
+	return streamSolutions(c, s, stringToRuneBoard(req.Board), 1000)
 }
 
 // Status endpoint to check if searcher is ready
 func statusHandler(c echo.Context) error {
+	s := searcherState.Load()
 	status := map[string]interface{}{
-		"ready": searcherReady,
+		"ready": s != nil,
 	}
-	if searcherReady {
-		status["solutions_count"] = len(searcher.GetSolutionSet().GetSolutions())
+	if s != nil {
+		status["solutions_count"] = len(s.GetSolutionSet().GetSolutions())
 	}
 	return c.JSON(http.StatusOK, status)
 }
@@ -303,9 +310,9 @@ func main() {
 	}
 }
 
-func gridFromSolutionIndex(idx int) [][]rune {
-	solution := searcher.GetSolutionSet().GetSolutions()[idx]
-	dictionary := searcher.GetSolutionSet().GetDictionary()
+func gridFromSolutionIndex(s *psolve.Searcher, idx int) [][]rune {
+	solution := s.GetSolutionSet().GetSolutions()[idx]
+	dictionary := s.GetSolutionSet().GetDictionary()
 	grid := make([][]rune, len(solution.GetWord()))
 	for i, row := range solution.GetWord() {
 		word := dictionary.GetWord()[row]
@@ -349,13 +356,13 @@ func stringToRuneBoard(board [][]string) [][]rune {
 	return runeBoard
 }
 
-func streamSolutions(c echo.Context, boardState [][]rune, limit int) error {
+func streamSolutions(c echo.Context, s *psolve.Searcher, boardState [][]rune, limit int) error {
 	c.Response().Header().Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
 	c.Response().WriteHeader(http.StatusOK)
 	// Generate solutions based on board state
 	ctx, cancel := context.WithTimeout(c.Request().Context(), time.Second*2)
 	defer cancel()
-	solutionChan, err := searcher.FindMatchingSolutions(ctx, boardState)
+	solutionChan, err := s.FindMatchingSolutions(ctx, boardState)
 	if err != nil {
 		fmt.Printf("Failed to find solutions: %v\n", err)
 		return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to find solutions: %v", err))
@@ -363,7 +370,7 @@ func streamSolutions(c echo.Context, boardState [][]rune, limit int) error {
 	enc := json.NewEncoder(c.Response())
 	i := 0
 	for solutionIdx := range solutionChan {
-		grid := gridFromSolutionIndex(solutionIdx)
+		grid := gridFromSolutionIndex(s, solutionIdx)
 		solution := Solution{
 			ID:   i + 1,
 			Grid: runeToStringBoard(grid),
