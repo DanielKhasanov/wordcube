@@ -16,7 +16,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unicode"
 
 	"github.com/danielkhasanov/wordcube/psolve"
 	"github.com/danielkhasanov/wordcube/reader"
@@ -381,16 +380,28 @@ func runeToStringBoard(board [][]rune) [][]string {
 	return stringBoard
 }
 
+// isASCIILetter reports whether r is an ASCII letter (a-z, A-Z).
+// validateBoardCells checks this narrower set rather than unicode.IsLetter:
+// the word list/dictionary is entirely ASCII English text, and a non-ASCII
+// letter (e.g. 'ñ', a Cyrillic or CJK letter - all accepted by
+// unicode.IsLetter) has no entry in psolve.Searcher's alphabet map, so it
+// would silently resolve to alphabet component 0 - the same component
+// reserved for "empty cell" - via Go's map zero-value default (see
+// psolve/search.go's populateAlphabet). That's exactly the collision this
+// validation exists to prevent, so unicode.IsLetter was too permissive to
+// catch it. An ASCII letter that simply doesn't appear at a given
+// row/column in the current dictionary (e.g. "z" in a position no word
+// happens to use) is still accepted and correctly falls through to a
+// legitimate zero-match result - letter usage naturally varies by position
+// and isn't itself invalid input.
+func isASCIILetter(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+}
+
 // validateBoardCells rejects any board cell that isn't a blank marker ("" or
-// "_") or a single alphabetic character. Without this, stringToRuneBoard
-// would silently truncate multi-character cells to their first rune and pass
-// non-letter runes (digits, symbols) straight through to the searcher, where
-// they'd resolve to alphabet component 0 - the same component reserved for
-// "no letter" - via Go's map zero-value default (see psolve/search.go's
-// populateAlphabet). That happens to still return a harmless empty-match
-// result today, but silently accepting garbage input is fragile and easy to
-// break with a future indexing change, so reject it explicitly at the API
-// boundary instead.
+// "_") or a single ASCII letter. Without this, stringToRuneBoard would
+// silently truncate multi-character cells to their first rune and pass
+// invalid runes straight through to the searcher.
 func validateBoardCells(board [][]string) error {
 	for i, row := range board {
 		for j, cell := range row {
@@ -398,7 +409,7 @@ func validateBoardCells(board [][]string) error {
 				continue
 			}
 			runes := []rune(cell)
-			if len(runes) != 1 || !unicode.IsLetter(runes[0]) {
+			if len(runes) != 1 || !isASCIILetter(runes[0]) {
 				return fmt.Errorf("invalid cell at row %d, col %d: must be a single letter or empty", i, j)
 			}
 		}
