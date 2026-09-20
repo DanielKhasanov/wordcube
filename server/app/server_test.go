@@ -270,6 +270,46 @@ func TestSecurityHeaders_Present(t *testing.T) {
 	}
 }
 
+// TestContentSecurityPolicy_RestrictsToSelf verifies the CSP directives that
+// matter for this app's threat model: no cross-origin script/style/connect
+// sources (blocking exfiltration or injected-script XSS payloads), no
+// framing by other sites (clickjacking), and no plugin/object execution.
+// 'unsafe-inline' is required in style-src only - confirmed via a real
+// Chromium load of the built frontend (site/dist) against this exact policy,
+// which showed shadcn/Radix UI components set inline style attributes for
+// positioning at runtime; script-src has no such need and stays strict.
+func TestContentSecurityPolicy_RestrictsToSelf(t *testing.T) {
+	resetSearcherState(t)
+	e := newEcho()
+
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	csp := rec.Header().Get("Content-Security-Policy")
+	if csp == "" {
+		t.Fatal("Content-Security-Policy header missing")
+	}
+
+	wantDirectives := []string{
+		"default-src 'self'",
+		"script-src 'self'",
+		"style-src 'self' 'unsafe-inline'",
+		"connect-src 'self'",
+		"frame-ancestors 'none'",
+		"base-uri 'self'",
+		"form-action 'self'",
+	}
+	for _, d := range wantDirectives {
+		if !strings.Contains(csp, d) {
+			t.Errorf("Content-Security-Policy = %q, want it to contain directive %q", csp, d)
+		}
+	}
+	if strings.Contains(csp, "script-src 'self' 'unsafe-inline'") {
+		t.Error("script-src must not allow 'unsafe-inline' - unlike style-src, no runtime script injection is needed and it would reopen the app to XSS payload execution")
+	}
+}
+
 func TestSolutionsHandler_StreamsMatchingSolutionAsNDJSON(t *testing.T) {
 	resetSearcherState(t)
 	searcherState.Store(newFixtureSearcher())

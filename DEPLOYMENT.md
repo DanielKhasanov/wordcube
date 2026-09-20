@@ -94,6 +94,32 @@ These, along with connection timeouts, security headers (`X-Content-Type-Options
 `X-Frame-Options`, HSTS), a 64K request body limit, and panic recovery, are covered
 by the test suite in `server/app/server_test.go`.
 
+### Content-Security-Policy
+
+The server also sends a fixed `Content-Security-Policy` header (not configurable via
+env var, since it's tuned to this specific frontend build rather than being a
+per-deployment operational setting):
+
+```
+default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
+img-src 'self' data:; connect-src 'self'; base-uri 'self'; form-action 'self';
+frame-ancestors 'none'
+```
+
+This assumes the standard deployment shape where the Go server serves both the API
+and the built frontend from the same origin (`e.Static("/", "static")` in
+`server/app/server.go`, populated by the Docker build) - `'self'` covers both. If
+you ever serve the frontend from a different origin than the API, `connect-src` will
+need to include that API origin explicitly, or the frontend's `fetch` calls will be
+blocked by the browser.
+
+`style-src` needs `'unsafe-inline'` because the shadcn/Radix UI components in
+`site/src/components/ui` set inline `style` attributes at runtime for positioning
+(popovers, dropdowns, etc.) - confirmed by loading the built frontend in a real
+Chromium instance and checking for CSP violation reports. `script-src` has no such
+need and stays strict (`'self'` only), so injected/inline `<script>` execution is
+still blocked.
+
 ## Application Structure
 
 - **Frontend**: React application built with Vite (in `site/` directory)
