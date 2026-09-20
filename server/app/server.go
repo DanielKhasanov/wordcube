@@ -362,8 +362,13 @@ func streamSolutions(c echo.Context, s *psolve.Searcher, boardState [][]rune, li
 	defer cancel()
 	solutionChan, err := s.FindMatchingSolutions(ctx, boardState)
 	if err != nil {
-		fmt.Printf("Failed to find solutions: %v\n", err)
-		return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to find solutions: %v", err))
+		// Log the real error server-side for diagnosis, but don't echo
+		// internal search-index details (e.g. "no indexed solutions for
+		// key: ...") back to the client - a generic message is enough for
+		// callers, and avoids leaking implementation details of the
+		// indexing scheme to anyone probing the endpoint.
+		log.Printf("Failed to find solutions: %v", err)
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to find solutions")
 	}
 	// Only commit the response (and thus the 200 status) once the search
 	// has actually started successfully - writing the header before this

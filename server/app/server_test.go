@@ -356,6 +356,9 @@ func TestSolutionsHandler_SearchErrorReturns500NotSilent200(t *testing.T) {
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status code = %d, want %d (body = %q)", rec.Code, http.StatusInternalServerError, rec.Body.String())
 	}
+	if strings.Contains(rec.Body.String(), "indexed solutions for key") {
+		t.Fatalf("response body leaked internal search-index error detail: %q", rec.Body.String())
+	}
 }
 
 func TestSolutionsHandler_RateLimited(t *testing.T) {
