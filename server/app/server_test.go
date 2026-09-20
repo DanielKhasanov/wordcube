@@ -280,6 +280,45 @@ func TestSolutionsHandler_RateLimited(t *testing.T) {
 	}
 }
 
+func TestSolutionsHandler_RateLimitIgnoresSpoofedForwardedForHeader(t *testing.T) {
+	resetSearcherState(t)
+	searcher = newFixtureSearcher()
+	searcherReady = true
+	t.Setenv("RATE_LIMIT_RPS", "1")
+	t.Setenv("RATE_LIMIT_BURST", "1")
+	// TRUST_PROXY_HEADERS is intentionally left unset: by default this app
+	// has no reverse proxy in front of it, so the rate limiter must key off
+	// the actual TCP connection address rather than a client-supplied
+	// X-Forwarded-For header, or any client could bypass per-IP limiting by
+	// sending a different header value on every request.
+	e := newEcho()
+
+	newReq := func(xff string) *http.Request {
+		body := strings.NewReader(`{"board":[["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"]]}`)
+		req := httptest.NewRequest(http.MethodPost, "/solutions", body)
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		req.Header.Set(echo.HeaderXForwardedFor, xff)
+		req.RemoteAddr = "198.51.100.1:1234"
+		return req
+	}
+
+	rec1 := httptest.NewRecorder()
+	e.ServeHTTP(rec1, newReq("1.1.1.1"))
+	if rec1.Code == http.StatusTooManyRequests {
+		t.Fatalf("first request unexpectedly rate limited (status %d)", rec1.Code)
+	}
+
+	// Same underlying connection, but a different (attacker-controlled)
+	// X-Forwarded-For value on every request. If the extractor trusted this
+	// header, each request would land in its own fresh bucket and never be
+	// limited.
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, newReq("2.2.2.2"))
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request with spoofed X-Forwarded-For status = %d, want %d (rate limit must key off RemoteAddr, not client-supplied headers)", rec2.Code, http.StatusTooManyRequests)
+	}
+}
+
 func TestPanicRecovery(t *testing.T) {
 	resetSearcherState(t)
 	e := newEcho()

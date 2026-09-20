@@ -107,12 +107,28 @@ func solutionsRateLimiterMiddleware() echo.MiddlewareFunc {
 	})
 }
 
+// ipExtractor returns how Echo (and the /solutions rate limiter, which keys
+// off c.RealIP()) determines a client's IP. It defaults to the raw TCP
+// connection address (echo.ExtractIPDirect): trusting the X-Forwarded-For/
+// X-Real-IP headers by default would let any client bypass per-IP rate
+// limiting simply by sending a different header value on every request,
+// since this app has no reverse proxy in front of it out of the box (see
+// DEPLOYMENT.md). Operators who do deploy behind a trusted reverse proxy on
+// their private network can opt in via TRUST_PROXY_HEADERS=true.
+func ipExtractor() echo.IPExtractor {
+	if os.Getenv("TRUST_PROXY_HEADERS") == "true" {
+		return echo.ExtractIPFromXFFHeader()
+	}
+	return echo.ExtractIPDirect()
+}
+
 // newEcho builds the Echo instance with all middleware and routes
 // registered, without starting a listener. This keeps route/middleware
 // wiring independently testable via httptest.
 func newEcho() *echo.Echo {
 	e := echo.New()
 	e.HideBanner = true
+	e.IPExtractor = ipExtractor()
 
 	// Recover must run first so a panic in any handler returns a 500
 	// instead of crashing the whole process.

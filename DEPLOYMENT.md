@@ -66,6 +66,14 @@ preserve existing dev/Codespaces behavior out of the box.
   to `POST /solutions` only (the one endpoint that runs a real search against the
   in-memory index). Defaults to 5 requests/second with a burst of 10. Requests over
   the limit receive HTTP 429.
+- `TRUST_PROXY_HEADERS` - set to `true` only if this server sits behind a trusted
+  reverse proxy that sets `X-Forwarded-For`. Defaults to `false`, meaning the
+  server (and the rate limiter above) identifies clients by the raw TCP connection
+  address only. **Do not set this unless you actually have a trusted proxy in
+  front of the container** - since neither `docker-compose.yml` nor the
+  `Dockerfile` in this repo add one by default, trusting these headers out of the
+  box would let any client bypass per-IP rate limiting by sending a different
+  `X-Forwarded-For` value on every request.
 - `TLS_CERT_FILE` / `TLS_KEY_FILE` - paths to a PEM certificate and private key. If
   both are set, the server terminates TLS itself (`tls.Config{MinVersion:
   tls.VersionTLS12}`) and listens with HTTPS on `:1323` instead of plain HTTP. If
