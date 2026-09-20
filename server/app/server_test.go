@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -332,5 +333,39 @@ func TestPanicRecovery(t *testing.T) {
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status code = %d, want %d (Recover middleware should convert panics to 500s)", rec.Code, http.StatusInternalServerError)
+	}
+}
+
+func TestListenAddr(t *testing.T) {
+	tests := []struct {
+		name string
+		port string
+		want string
+	}{
+		{name: "unset falls back to default", port: "", want: ":1323"},
+		{name: "valid port is honored", port: "8080", want: ":8080"},
+		{name: "non-numeric falls back to default", port: "not-a-port", want: ":1323"},
+		{name: "out-of-range falls back to default", port: "70000", want: ":1323"},
+		{name: "zero falls back to default", port: "0", want: ":1323"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prev, hadPrev := os.LookupEnv("PORT")
+			t.Cleanup(func() {
+				if hadPrev {
+					os.Setenv("PORT", prev)
+				} else {
+					os.Unsetenv("PORT")
+				}
+			})
+			if tt.port == "" {
+				os.Unsetenv("PORT")
+			} else {
+				os.Setenv("PORT", tt.port)
+			}
+			if got := listenAddr(); got != tt.want {
+				t.Fatalf("listenAddr() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

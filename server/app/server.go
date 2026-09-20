@@ -21,6 +21,8 @@ import (
 )
 
 const (
+	defaultPort = "1323"
+
 	readHeaderTimeout = 5 * time.Second
 	readTimeout       = 10 * time.Second
 	writeTimeout      = 30 * time.Second
@@ -122,6 +124,23 @@ func ipExtractor() echo.IPExtractor {
 	return echo.ExtractIPDirect()
 }
 
+// listenAddr returns the ":<port>" address the server binds to. It honors
+// the PORT env var (docker-compose.yml has set this since the container was
+// first written, but server.go never read it - the listener was always
+// hardcoded to :1323 regardless of PORT's value) and falls back to
+// defaultPort when PORT is unset or not a valid port number.
+func listenAddr() string {
+	port := os.Getenv("PORT")
+	if port == "" {
+		return ":" + defaultPort
+	}
+	if n, err := strconv.Atoi(port); err != nil || n <= 0 || n > 65535 {
+		log.Printf("PORT=%q is not a valid port number; falling back to :%s", port, defaultPort)
+		return ":" + defaultPort
+	}
+	return ":" + port
+}
+
 // newEcho builds the Echo instance with all middleware and routes
 // registered, without starting a listener. This keeps route/middleware
 // wiring independently testable via httptest.
@@ -207,6 +226,8 @@ func main() {
 	e.Server.WriteTimeout = writeTimeout
 	e.Server.IdleTimeout = idleTimeout
 
+	addr := listenAddr()
+
 	certFile := os.Getenv("TLS_CERT_FILE")
 	keyFile := os.Getenv("TLS_KEY_FILE")
 	if certFile != "" && keyFile != "" {
@@ -215,12 +236,12 @@ func main() {
 		e.TLSServer.WriteTimeout = writeTimeout
 		e.TLSServer.IdleTimeout = idleTimeout
 		e.TLSServer.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-		e.Logger.Fatal(e.StartTLS(":1323", certFile, keyFile))
+		e.Logger.Fatal(e.StartTLS(addr, certFile, keyFile))
 		return
 	}
 
 	log.Println("TLS_CERT_FILE/TLS_KEY_FILE not set; serving plain HTTP. Terminate TLS here or at a reverse proxy in production.")
-	e.Logger.Fatal(e.Start(":1323"))
+	e.Logger.Fatal(e.Start(addr))
 }
 
 func gridFromSolutionIndex(idx int) [][]rune {

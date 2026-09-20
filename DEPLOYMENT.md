@@ -57,6 +57,10 @@ The Go server (`server/app/server.go`) reads the following environment variables
 control its networking/security posture. All are optional; defaults are chosen to
 preserve existing dev/Codespaces behavior out of the box.
 
+- `PORT` - the TCP port the server listens on (plain HTTP or TLS, whichever is
+  active). Defaults to `1323`, matching the port `docker-compose.yml` maps and has
+  always set via this same env var. Falls back to the default with a logged warning
+  if set to something that isn't a valid port number (1-65535).
 - `ALLOWED_ORIGINS` - comma-separated list of origins allowed by CORS
   (e.g. `https://wordcube.example.com,https://staging.wordcube.example.com`).
   Defaults to `*` (all origins allowed), since the frontend may be served from an
@@ -76,14 +80,15 @@ preserve existing dev/Codespaces behavior out of the box.
   `X-Forwarded-For` value on every request.
 - `TLS_CERT_FILE` / `TLS_KEY_FILE` - paths to a PEM certificate and private key. If
   both are set, the server terminates TLS itself (`tls.Config{MinVersion:
-  tls.VersionTLS12}`) and listens with HTTPS on `:1323` instead of plain HTTP. If
-  unset (the default, including the current Docker/Compose setup), the server
-  serves plain HTTP and expects TLS to be terminated in front of it - e.g. by a
-  reverse proxy (nginx, Caddy, an ALB/Cloud Load Balancer, etc.) or a platform
-  that handles TLS for you. Neither `docker-compose.yml` nor the `Dockerfile` in
-  this repo currently set up such a proxy, so anyone deploying this image directly
-  on the open internet must either supply `TLS_CERT_FILE`/`TLS_KEY_FILE` or put a
-  TLS-terminating proxy in front of container port 1323.
+  tls.VersionTLS12}`) and listens with HTTPS on the configured `PORT` instead of
+  plain HTTP. If unset (the default, including the current Docker/Compose setup),
+  the server serves plain HTTP and expects TLS to be terminated in front of it -
+  e.g. by a reverse proxy (nginx, Caddy, an ALB/Cloud Load Balancer, etc.) or a
+  platform that handles TLS for you. Neither `docker-compose.yml` nor the
+  `Dockerfile` in this repo currently set up such a proxy, so anyone deploying this
+  image directly on the open internet must either supply
+  `TLS_CERT_FILE`/`TLS_KEY_FILE` or put a TLS-terminating proxy in front of
+  container port `1323` (or whatever `PORT` is set to).
 
 These, along with connection timeouts, security headers (`X-Content-Type-Options`,
 `X-Frame-Options`, HSTS), a 64K request body limit, and panic recovery, are covered
