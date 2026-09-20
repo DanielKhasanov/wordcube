@@ -779,6 +779,63 @@ func TestTLSConfig_AcceptsTLS12AndAbove(t *testing.T) {
 	}
 }
 
+// TestTLSConfig_RejectsCBCCipherSuites proves that newTLSConfig()'s explicit
+// CipherSuites list excludes CBC-mode suites: a client offering only CBC
+// suites at TLS 1.2 fails the handshake entirely (Go's default cipher list,
+// used when CipherSuites is nil, would have accepted these), while a client
+// offering only AEAD suites (AES-GCM/ChaCha20-Poly1305) still succeeds.
+func TestTLSConfig_RejectsCBCCipherSuites(t *testing.T) {
+	ts := tlsTestServer(t)
+
+	cbcOnly := []uint16{
+		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+	}
+	t.Run("CBC-only client is rejected", func(t *testing.T) {
+		client := &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true, //nolint:gosec // test-only, dialing our own self-signed cert
+					MinVersion:         tls.VersionTLS12,
+					MaxVersion:         tls.VersionTLS12, // CipherSuites is ignored by Go's TLS 1.3 stack
+					CipherSuites:       cbcOnly,
+				},
+			},
+		}
+		_, err := client.Get(ts.URL + "/status")
+		if err == nil {
+			t.Fatal("handshake offering only CBC cipher suites unexpectedly succeeded; newTLSConfig should reject them")
+		}
+	})
+
+	aeadOnly := []uint16{
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+	}
+	t.Run("AEAD-only client still succeeds", func(t *testing.T) {
+		client := &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true, //nolint:gosec // test-only, dialing our own self-signed cert
+					MinVersion:         tls.VersionTLS12,
+					MaxVersion:         tls.VersionTLS12,
+					CipherSuites:       aeadOnly,
+				},
+			},
+		}
+		resp, err := client.Get(ts.URL + "/status")
+		if err != nil {
+			t.Fatalf("handshake offering only AEAD cipher suites failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status code = %d, want %d", resp.StatusCode, http.StatusOK)
+		}
+	})
+}
+
 // TestConcurrentReadinessPublishHasNoDataRace exercises the exact concurrency
 // shape production sees at startup: initializeSearcher publishes the
 // searcher from a background goroutine (main() launches it via `go func()`)

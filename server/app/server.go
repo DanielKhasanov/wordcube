@@ -150,8 +150,28 @@ func ipExtractor() echo.IPExtractor {
 // config (rather than a hand-copied approximation) against a real TLS
 // handshake. MinVersion excludes TLS 1.0/1.1, which are both deprecated
 // (RFC 8996) and vulnerable to downgrade/BEAST-style attacks.
+//
+// CipherSuites is restricted to AEAD-only suites (AES-GCM and
+// ChaCha20-Poly1305). Go's default TLS 1.2 cipher list (used when
+// CipherSuites is nil) also includes several CBC-mode suites for
+// compatibility with older clients; CBC in TLS 1.2 has a history of
+// padding-oracle/timing attacks (e.g. Lucky13), so this app - which has no
+// legacy client compatibility requirement - drops them rather than
+// negotiating a weaker mode when a client offers it. This only affects TLS
+// 1.2 negotiation: Go's TLS 1.3 implementation always uses its own fixed set
+// of AEAD cipher suites and ignores CipherSuites entirely.
 func newTLSConfig() *tls.Config {
-	return &tls.Config{MinVersion: tls.VersionTLS12}
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		},
+	}
 }
 
 // listenAddr returns the ":<port>" address the server binds to. It honors

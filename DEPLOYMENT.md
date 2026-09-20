@@ -79,9 +79,17 @@ preserve existing dev/Codespaces behavior out of the box.
   box would let any client bypass per-IP rate limiting by sending a different
   `X-Forwarded-For` value on every request.
 - `TLS_CERT_FILE` / `TLS_KEY_FILE` - paths to a PEM certificate and private key. If
-  both are set, the server terminates TLS itself (`tls.Config{MinVersion:
-  tls.VersionTLS12}`) and listens with HTTPS on the configured `PORT` instead of
-  plain HTTP. If unset (the default, including the current Docker/Compose setup),
+  both are set, the server terminates TLS itself and listens with HTTPS on the
+  configured `PORT` instead of plain HTTP. The TLS config (`newTLSConfig` in
+  `server/app/server.go`) sets `MinVersion: tls.VersionTLS12` (rejecting the
+  deprecated, downgrade-prone TLS 1.0/1.1) and restricts `CipherSuites` to
+  AEAD-only suites (AES-GCM and ChaCha20-Poly1305), excluding the CBC-mode
+  suites Go's default TLS 1.2 cipher list otherwise allows for legacy-client
+  compatibility - this app has no such legacy client to support, so CBC (with
+  its history of padding-oracle/timing attacks) is disabled outright rather
+  than negotiated as a fallback. This restriction only affects TLS 1.2
+  negotiation; TLS 1.3 in Go always uses its own fixed AEAD suite set
+  regardless of `CipherSuites`. If unset (the default, including the current Docker/Compose setup),
   the server serves plain HTTP and expects TLS to be terminated in front of it -
   e.g. by a reverse proxy (nginx, Caddy, an ALB/Cloud Load Balancer, etc.) or a
   platform that handles TLS for you. Neither `docker-compose.yml` nor the
