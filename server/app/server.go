@@ -3,16 +3,26 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/danielkhasanov/wordcube/psolve"
 	"github.com/danielkhasanov/wordcube/reader"
 	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+)
+
+const (
+	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 10 * time.Second
+	writeTimeout      = 30 * time.Second
+	idleTimeout       = 120 * time.Second
 )
 
 type (
@@ -49,6 +59,83 @@ func initializeSearcher() error {
 	return nil
 }
 
+// allowedOrigins returns the CORS origin allowlist. It defaults to "*" to
+// preserve existing behavior (the frontend may be served from an arbitrary
+// dev-environment URL), but operators can lock this down in production via
+// the ALLOWED_ORIGINS env var (comma-separated).
+func allowedOrigins() []string {
+	if v := os.Getenv("ALLOWED_ORIGINS"); v != "" {
+		return strings.Split(v, ",")
+	}
+	return []string{"*"}
+}
+
+// newEcho builds the Echo instance with all middleware and routes
+// registered, without starting a listener. This keeps route/middleware
+// wiring independently testable via httptest.
+func newEcho() *echo.Echo {
+	e := echo.New()
+	e.HideBanner = true
+
+	// Recover must run first so a panic in any handler returns a 500
+	// instead of crashing the whole process.
+	e.Use(middleware.Recover())
+	e.Use(middleware.Logger())
+	e.Use(middleware.SecureWithConfig(middleware.SecureConfig{
+		XSSProtection:      "1; mode=block",
+		ContentTypeNosniff: "nosniff",
+		XFrameOptions:      "DENY",
+		HSTSMaxAge:         31536000,
+	}))
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins: allowedOrigins(),
+		AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodOptions},
+		AllowHeaders: []string{echo.HeaderContentType},
+	}))
+	// The board payload is a small 5x5 grid of single characters; cap the
+	// request body well above that to block oversized-payload abuse.
+	e.Use(middleware.BodyLimit("64K"))
+
+	e.POST("/solutions", solutionsHandler)
+	e.GET("/status", statusHandler)
+
+	// Serve static files from the frontend build
+	e.Static("/", "static")
+
+	return e
+}
+
+func solutionsHandler(c echo.Context) error {
+	if !searcherReady {
+		return echo.NewHTTPError(http.StatusServiceUnavailable, "Solutions are still being loaded. Please try again in a moment.")
+	}
+	var req BoardRequest
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "Invalid board format")
+	}
+	// Validate board dimensions
+	if len(req.Board) != 5 {
+		return echo.NewHTTPError(http.StatusBadRequest, "Board must be 5x5")
+	}
+	for _, row := range req.Board {
+		if len(row) != 5 {
+			return echo.NewHTTPError(http.StatusBadRequest, "Board must be 5x5")
+		}
+	}
+	return streamSolutions(c, stringToRuneBoard(req.Board), 1000)
+}
+
+// Status endpoint to check if searcher is ready
+func statusHandler(c echo.Context) error {
+	status := map[string]interface{}{
+		"ready": searcherReady,
+	}
+	if searcherReady {
+		status["solutions_count"] = len(searcher.GetSolutionSet().GetSolutions())
+	}
+	return c.JSON(http.StatusOK, status)
+}
+
 func main() {
 	// Initialize the searcher in the background
 	go func() {
@@ -57,57 +144,29 @@ func main() {
 		}
 	}()
 
-	e := echo.New()
+	e := newEcho()
 
-	// Enable CORS for frontend
-	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
-			c.Response().Header().Set("Access-Control-Allow-Origin", "*")
-			c.Response().Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			c.Response().Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	// Guard against slow/stalled clients holding connections open
+	// (e.g. slowloris-style attacks); net/http's zero-value timeouts are
+	// unbounded.
+	e.Server.ReadHeaderTimeout = readHeaderTimeout
+	e.Server.ReadTimeout = readTimeout
+	e.Server.WriteTimeout = writeTimeout
+	e.Server.IdleTimeout = idleTimeout
 
-			if c.Request().Method == "OPTIONS" {
-				return c.NoContent(http.StatusNoContent)
-			}
+	certFile := os.Getenv("TLS_CERT_FILE")
+	keyFile := os.Getenv("TLS_KEY_FILE")
+	if certFile != "" && keyFile != "" {
+		e.TLSServer.ReadHeaderTimeout = readHeaderTimeout
+		e.TLSServer.ReadTimeout = readTimeout
+		e.TLSServer.WriteTimeout = writeTimeout
+		e.TLSServer.IdleTimeout = idleTimeout
+		e.TLSServer.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		e.Logger.Fatal(e.StartTLS(":1323", certFile, keyFile))
+		return
+	}
 
-			return next(c)
-		}
-	})
-
-	e.POST("/solutions", func(c echo.Context) error {
-		if !searcherReady {
-			return echo.NewHTTPError(http.StatusServiceUnavailable, "Solutions are still being loaded. Please try again in a moment.")
-		}
-		var req BoardRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "Invalid board format")
-		}
-		// Validate board dimensions
-		if len(req.Board) != 5 {
-			return echo.NewHTTPError(http.StatusBadRequest, "Board must be 5x5")
-		}
-		for _, row := range req.Board {
-			if len(row) != 5 {
-				return echo.NewHTTPError(http.StatusBadRequest, "Board must be 5x5")
-			}
-		}
-		return streamSolutions(c, stringToRuneBoard(req.Board), 1000)
-	})
-
-	// Status endpoint to check if searcher is ready
-	e.GET("/status", func(c echo.Context) error {
-		status := map[string]interface{}{
-			"ready": searcherReady,
-		}
-		if searcherReady {
-			status["solutions_count"] = len(searcher.GetSolutionSet().GetSolutions())
-		}
-		return c.JSON(http.StatusOK, status)
-	})
-
-	// Serve static files from the frontend build
-	e.Static("/", "static")
-
+	log.Println("TLS_CERT_FILE/TLS_KEY_FILE not set; serving plain HTTP. Terminate TLS here or at a reverse proxy in production.")
 	e.Logger.Fatal(e.Start(":1323"))
 }
 
