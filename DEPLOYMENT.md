@@ -152,6 +152,9 @@ The Dockerfile uses a multi-stage build process:
    - Copies the built Go binary
    - Copies frontend build assets to `static/` directory
    - Copies required data files
+   - Runs as an unprivileged `wordcube` user (not root) - the app binds to
+     port 1323, which doesn't require root, and never writes to disk at
+     runtime, so there's no reason to run it with root privileges
    - Exposes port 1323
 
 ## API Endpoints
