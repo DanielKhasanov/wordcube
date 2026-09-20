@@ -10,26 +10,27 @@ export function useSolutions(board?: string[][]) {
   const [error, setError] = useState<Error | null>(null);
 
   useEffect(() => {
-    let isCancelled = false;
-    
+    const controller = new AbortController();
+
     const fetchSolutions = async () => {
       setIsLoading(true);
       setError(null);
       setSolutions([]);
-      
+
       try {
         const requestBody = {
           board: board || Array(5).fill(null).map(() => Array(5).fill(''))
         };
-                
+
         const response = await fetch(SOLUTIONS_ENDPOINT, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify(requestBody),
+          signal: controller.signal,
         });
-        
+
         if (!response.ok) {
           throw new Error('Failed to fetch solutions');
         }
@@ -45,21 +46,17 @@ export function useSolutions(board?: string[][]) {
         try {
           while (true) {
             const { done, value } = await reader.read();
-            
+
             if (done) {
               break;
             }
-            
-            if (isCancelled) {
-              break;
-            }
-            
+
             buffer += decoder.decode(value, { stream: true });
-            
+
             // Split by newlines and process each complete JSON object
             const lines = buffer.split('\n');
             buffer = lines.pop() || ''; // Keep the last incomplete line
-            
+
             for (const line of lines) {
               if (line.trim()) {
                 try {
@@ -76,11 +73,12 @@ export function useSolutions(board?: string[][]) {
           reader.releaseLock();
         }
       } catch (err) {
-        if (!isCancelled) {
-          setError(err instanceof Error ? err : new Error('Unknown error'));
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          return;
         }
+        setError(err instanceof Error ? err : new Error('Unknown error'));
       } finally {
-        if (!isCancelled) {
+        if (!controller.signal.aborted) {
           setIsLoading(false);
         }
       }
@@ -89,7 +87,7 @@ export function useSolutions(board?: string[][]) {
     fetchSolutions();
 
     return () => {
-      isCancelled = true;
+      controller.abort();
     };
   }, [board]); // Add board as dependency
 
