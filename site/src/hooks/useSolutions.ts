@@ -11,6 +11,16 @@ const SOLUTIONS_ENDPOINT = `${API_BASE_URL}/solutions`;
 // Retry after a short delay instead of surfacing it as an error.
 const NOT_READY_RETRY_DELAY_MS = 1000;
 
+// If the backend's searcher never finishes initializing (e.g. a missing or
+// corrupt solutions.textpb causes initializeSearcher to fail permanently -
+// see server/app/server.go), GET /status and POST /solutions both stay in
+// the "not ready" state forever with no way for the client to distinguish
+// that from "still loading". Without a cap, useSolutions would retry every
+// NOT_READY_RETRY_DELAY_MS indefinitely, leaving the UI stuck on a loading
+// spinner forever with no indication anything is wrong. Cap the retries and
+// surface a real error once exceeded.
+const MAX_NOT_READY_RETRIES = 30;
+
 export function useSolutions(board?: string[][]) {
   const [solutions, setSolutions] = useState<Solution[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -19,6 +29,7 @@ export function useSolutions(board?: string[][]) {
   useEffect(() => {
     const controller = new AbortController();
     let retryTimeout: ReturnType<typeof setTimeout> | undefined;
+    let notReadyRetries = 0;
 
     const fetchSolutions = async () => {
       let retrying = false;
@@ -37,6 +48,10 @@ export function useSolutions(board?: string[][]) {
         });
 
         if (response.status === 503) {
+          notReadyRetries += 1;
+          if (notReadyRetries > MAX_NOT_READY_RETRIES) {
+            throw new Error('Solutions failed to load. Please refresh the page and try again.');
+          }
           retrying = true;
           retryTimeout = setTimeout(fetchSolutions, NOT_READY_RETRY_DELAY_MS);
           return;

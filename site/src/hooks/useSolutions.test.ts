@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { renderHook, waitFor } from '@testing-library/react';
+import { act, renderHook, waitFor } from '@testing-library/react';
 import { useSolutions } from './useSolutions';
 import { Solution } from '../types/api';
 
@@ -83,6 +83,27 @@ describe('useSolutions', () => {
 
     expect(result.current.error).toBeNull();
     expect(result.current.data).toEqual(solutions);
+  });
+
+  it('surfaces an error instead of retrying forever when the server never becomes ready', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 503 }));
+    vi.stubGlobal('fetch', fetchMock);
+    vi.useFakeTimers();
+
+    const { result } = renderHook(() => useSolutions());
+
+    // 31 retries: the 31st (index 30, i.e. notReadyRetries=31) exceeds
+    // MAX_NOT_READY_RETRIES=30 and should surface an error instead of
+    // scheduling another retry.
+    for (let i = 0; i < 31; i++) {
+      await act(() => vi.advanceTimersByTimeAsync(1000));
+    }
+
+    expect(result.current.isLoading).toBe(false);
+    expect(result.current.error).not.toBeNull();
+    expect(result.current.error?.message).toMatch(/refresh the page/i);
+
+    vi.useRealTimers();
   });
 
   it('surfaces an error when the server responds with a non-ok status', async () => {
