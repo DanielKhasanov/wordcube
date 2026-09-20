@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -365,6 +366,79 @@ func TestListenAddr(t *testing.T) {
 			}
 			if got := listenAddr(); got != tt.want {
 				t.Fatalf("listenAddr() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// tlsTestServer starts a real TLS listener serving newEcho(), using the
+// exact tls.Config production returns from newTLSConfig() (httptest fills in
+// a generated self-signed cert since TLS.Certificates is left empty). This
+// exercises the actual TLS handshake negotiation rather than just asserting
+// on the tls.Config struct's fields.
+func tlsTestServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	resetSearcherState(t)
+	ts := httptest.NewUnstartedServer(newEcho())
+	ts.TLS = newTLSConfig()
+	ts.StartTLS()
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func TestTLSConfig_RejectsPreTLS12Handshakes(t *testing.T) {
+	ts := tlsTestServer(t)
+
+	for _, tt := range []struct {
+		name       string
+		maxVersion uint16
+	}{
+		{name: "TLS 1.0", maxVersion: tls.VersionTLS10},
+		{name: "TLS 1.1", maxVersion: tls.VersionTLS11},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{
+						InsecureSkipVerify: true, //nolint:gosec // test-only, dialing our own self-signed cert
+						MaxVersion:         tt.maxVersion,
+					},
+				},
+			}
+			_, err := client.Get(ts.URL + "/status")
+			if err == nil {
+				t.Fatalf("handshake capped at %s unexpectedly succeeded; MinVersion=TLS1.2 should reject it", tt.name)
+			}
+		})
+	}
+}
+
+func TestTLSConfig_AcceptsTLS12AndAbove(t *testing.T) {
+	ts := tlsTestServer(t)
+
+	for _, tt := range []struct {
+		name       string
+		minVersion uint16
+	}{
+		{name: "TLS 1.2", minVersion: tls.VersionTLS12},
+		{name: "TLS 1.3", minVersion: tls.VersionTLS13},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{
+						InsecureSkipVerify: true, //nolint:gosec // test-only, dialing our own self-signed cert
+						MinVersion:         tt.minVersion,
+					},
+				},
+			}
+			resp, err := client.Get(ts.URL + "/status")
+			if err != nil {
+				t.Fatalf("handshake with MinVersion=%s failed: %v", tt.name, err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status code = %d, want %d", resp.StatusCode, http.StatusOK)
 			}
 		})
 	}

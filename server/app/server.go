@@ -124,6 +124,15 @@ func ipExtractor() echo.IPExtractor {
 	return echo.ExtractIPDirect()
 }
 
+// newTLSConfig returns the tls.Config used for the server's HTTPS listener.
+// It is factored out from main() so tests can exercise the exact production
+// config (rather than a hand-copied approximation) against a real TLS
+// handshake. MinVersion excludes TLS 1.0/1.1, which are both deprecated
+// (RFC 8996) and vulnerable to downgrade/BEAST-style attacks.
+func newTLSConfig() *tls.Config {
+	return &tls.Config{MinVersion: tls.VersionTLS12}
+}
+
 // listenAddr returns the ":<port>" address the server binds to. It honors
 // the PORT env var (docker-compose.yml has set this since the container was
 // first written, but server.go never read it - the listener was always
@@ -235,7 +244,7 @@ func main() {
 		e.TLSServer.ReadTimeout = readTimeout
 		e.TLSServer.WriteTimeout = writeTimeout
 		e.TLSServer.IdleTimeout = idleTimeout
-		e.TLSServer.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		e.TLSServer.TLSConfig = newTLSConfig()
 		e.Logger.Fatal(e.StartTLS(addr, certFile, keyFile))
 		return
 	}
