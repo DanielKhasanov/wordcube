@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/danielkhasanov/wordcube/psolve"
 	"github.com/danielkhasanov/wordcube/reader"
@@ -273,6 +274,9 @@ func solutionsHandler(c echo.Context) error {
 			return echo.NewHTTPError(http.StatusBadRequest, "Board must be 5x5")
 		}
 	}
+	if err := validateBoardCells(req.Board); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
 	return streamSolutions(c, s, stringToRuneBoard(req.Board), 1000)
 }
 
@@ -359,6 +363,31 @@ func runeToStringBoard(board [][]rune) [][]string {
 		stringBoard[i] = stringRow
 	}
 	return stringBoard
+}
+
+// validateBoardCells rejects any board cell that isn't a blank marker ("" or
+// "_") or a single alphabetic character. Without this, stringToRuneBoard
+// would silently truncate multi-character cells to their first rune and pass
+// non-letter runes (digits, symbols) straight through to the searcher, where
+// they'd resolve to alphabet component 0 - the same component reserved for
+// "no letter" - via Go's map zero-value default (see psolve/search.go's
+// populateAlphabet). That happens to still return a harmless empty-match
+// result today, but silently accepting garbage input is fragile and easy to
+// break with a future indexing change, so reject it explicitly at the API
+// boundary instead.
+func validateBoardCells(board [][]string) error {
+	for i, row := range board {
+		for j, cell := range row {
+			if cell == "" || cell == "_" {
+				continue
+			}
+			runes := []rune(cell)
+			if len(runes) != 1 || !unicode.IsLetter(runes[0]) {
+				return fmt.Errorf("invalid cell at row %d, col %d: must be a single letter or empty", i, j)
+			}
+		}
+	}
+	return nil
 }
 
 func stringToRuneBoard(board [][]string) [][]rune {

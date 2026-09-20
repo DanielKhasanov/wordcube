@@ -98,6 +98,9 @@ func TestSolutionsHandler_RejectsMalformedBoard(t *testing.T) {
 		{desc: "too few rows", body: `{"board":[["a","b","c","d","e"]]}`},
 		{desc: "too few columns", body: `{"board":[["a"],["a"],["a"],["a"],["a"]]}`},
 		{desc: "empty body", body: ``},
+		{desc: "multi-character cell", body: `{"board":[["ab","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"]]}`},
+		{desc: "digit cell", body: `{"board":[["5","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"]]}`},
+		{desc: "symbol cell", body: `{"board":[["$","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"]]}`},
 	}
 
 	for _, test := range tests {
@@ -111,6 +114,23 @@ func TestSolutionsHandler_RejectsMalformedBoard(t *testing.T) {
 				t.Fatalf("status code = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
 			}
 		})
+	}
+}
+
+func TestSolutionsHandler_AcceptsBlankMarkersAndSingleLetters(t *testing.T) {
+	resetSearcherState(t)
+	searcherState.Store(newFixtureSearcher())
+	e := newEcho()
+
+	// "" and "_" both mean blank; single letters (any case) are valid fills.
+	body := `{"board":[["a","","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"]]}`
+	req := httptest.NewRequest(http.MethodPost, "/solutions", strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 }
 
