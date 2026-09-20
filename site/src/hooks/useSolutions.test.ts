@@ -62,6 +62,31 @@ describe('useSolutions', () => {
     expect(result.current.data).toEqual([{ id: 1, grid: [['a']] }]);
   });
 
+  it('skips lines that are valid JSON but not shaped like a Solution', async () => {
+    const malformedLines = [
+      JSON.stringify({ notASolution: true }),
+      JSON.stringify({ id: 'not-a-number', grid: [['a']] }),
+      JSON.stringify({ id: 2, grid: 'not-an-array' }),
+      JSON.stringify({ id: 3, grid: [[1, 2, 3]] }),
+      JSON.stringify(null),
+      JSON.stringify('a bare string'),
+    ];
+    const goodSolution: Solution = { id: 4, grid: [['a']] };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(ndjsonStream([...malformedLines, jsonLine(goodSolution)]), {
+        status: 200,
+      })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { result } = renderHook(() => useSolutions());
+
+    await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+    expect(result.current.error).toBeNull();
+    expect(result.current.data).toEqual([goodSolution]);
+  });
+
   it('retries without surfacing an error when the server responds 503 (still loading)', async () => {
     const solutions: Solution[] = [{ id: 1, grid: [['a']] }];
     const fetchMock = vi

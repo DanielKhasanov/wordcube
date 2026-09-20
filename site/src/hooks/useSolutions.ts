@@ -21,6 +21,34 @@ const NOT_READY_RETRY_DELAY_MS = 1000;
 // surface a real error once exceeded.
 const MAX_NOT_READY_RETRIES = 30;
 
+// JSON.parse only proves a line is syntactically valid JSON, not that it has
+// the Solution shape - a bare `as Solution` cast after parsing is a
+// compile-time-only assertion with zero runtime effect, so a structurally
+// wrong but still-valid-JSON line (e.g. a proxy/CDN error page fragment, a
+// future incompatible API response, or a corrupted byte range) would flow
+// straight into React state unchecked. Since there is no error boundary
+// anywhere in this app (confirmed via a repo-wide search), a downstream
+// component indexing into a malformed grid (e.g. WordSquare assuming 5x5
+// string[][]) would crash the whole render tree rather than fail gracefully.
+// Validate the shape at the network boundary, symmetric with the board input
+// validation already enforced server-side (see validateBoardCells in
+// server/app/server.go).
+function isSolution(value: unknown): value is Solution {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (typeof candidate.id !== 'number') {
+    return false;
+  }
+  if (!Array.isArray(candidate.grid)) {
+    return false;
+  }
+  return candidate.grid.every(
+    (row) => Array.isArray(row) && row.every((cell) => typeof cell === 'string')
+  );
+}
+
 export function useSolutions(board?: string[][]) {
   const [solutions, setSolutions] = useState<Solution[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -86,9 +114,13 @@ export function useSolutions(board?: string[][]) {
             for (const line of lines) {
               if (line.trim()) {
                 try {
-                  const solution = JSON.parse(line.trim()) as Solution;
+                  const parsed: unknown = JSON.parse(line.trim());
+                  if (!isSolution(parsed)) {
+                    console.warn('Skipping malformed solution:', line);
+                    continue;
+                  }
                   // Add solution immediately to trigger re-render
-                  setSolutions(prev => [...prev, solution]);
+                  setSolutions(prev => [...prev, parsed]);
                 } catch (e) {
                   console.warn('Failed to parse solution:', line, e);
                 }
