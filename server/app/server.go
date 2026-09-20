@@ -5,12 +5,15 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/danielkhasanov/wordcube/psolve"
@@ -27,6 +30,11 @@ const (
 	readTimeout       = 10 * time.Second
 	writeTimeout      = 30 * time.Second
 	idleTimeout       = 120 * time.Second
+
+	// shutdownTimeout bounds how long a graceful shutdown waits for
+	// in-flight requests (including streaming /solutions responses) to
+	// finish before forcibly closing remaining connections.
+	shutdownTimeout = 10 * time.Second
 
 	// defaultSolutionsRateLimit and defaultSolutionsRateBurst bound how
 	// often a single client IP may hit the expensive /solutions search
@@ -150,6 +158,33 @@ func listenAddr() string {
 	return ":" + port
 }
 
+// runWithGracefulShutdown runs startFn (an e.Start/e.StartTLS call, which
+// blocks until the listener stops or errors) and, when ctx is canceled (a
+// SIGINT/SIGTERM), calls e.Shutdown so in-flight requests - including
+// streaming /solutions responses - get up to shutdownTimeout to finish
+// instead of having their connections killed outright. This matters because
+// container orchestrators (Docker, Kubernetes) send SIGTERM on stop/restart,
+// and without this the default net/http behavior is to close all
+// connections immediately.
+func runWithGracefulShutdown(ctx context.Context, e *echo.Echo, startFn func() error) error {
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- startFn()
+	}()
+
+	select {
+	case err := <-serveErr:
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := e.Shutdown(shutdownCtx); err != nil {
+			return err
+		}
+		return <-serveErr
+	}
+}
+
 // newEcho builds the Echo instance with all middleware and routes
 // registered, without starting a listener. This keeps route/middleware
 // wiring independently testable via httptest.
@@ -237,6 +272,7 @@ func main() {
 
 	addr := listenAddr()
 
+	var startFn func() error
 	certFile := os.Getenv("TLS_CERT_FILE")
 	keyFile := os.Getenv("TLS_KEY_FILE")
 	if certFile != "" && keyFile != "" {
@@ -245,12 +281,18 @@ func main() {
 		e.TLSServer.WriteTimeout = writeTimeout
 		e.TLSServer.IdleTimeout = idleTimeout
 		e.TLSServer.TLSConfig = newTLSConfig()
-		e.Logger.Fatal(e.StartTLS(addr, certFile, keyFile))
-		return
+		startFn = func() error { return e.StartTLS(addr, certFile, keyFile) }
+	} else {
+		log.Println("TLS_CERT_FILE/TLS_KEY_FILE not set; serving plain HTTP. Terminate TLS here or at a reverse proxy in production.")
+		startFn = func() error { return e.Start(addr) }
 	}
 
-	log.Println("TLS_CERT_FILE/TLS_KEY_FILE not set; serving plain HTTP. Terminate TLS here or at a reverse proxy in production.")
-	e.Logger.Fatal(e.Start(addr))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := runWithGracefulShutdown(ctx, e, startFn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		e.Logger.Fatal(err)
+	}
 }
 
 func gridFromSolutionIndex(idx int) [][]rune {

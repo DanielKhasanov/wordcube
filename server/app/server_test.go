@@ -2,13 +2,17 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	cpb "github.com/danielkhasanov/wordcube/gen/proto/v1"
 	"github.com/danielkhasanov/wordcube/psolve"
@@ -410,6 +414,90 @@ func TestTLSConfig_RejectsPreTLS12Handshakes(t *testing.T) {
 				t.Fatalf("handshake capped at %s unexpectedly succeeded; MinVersion=TLS1.2 should reject it", tt.name)
 			}
 		})
+	}
+}
+
+// TestRunWithGracefulShutdown_WaitsForInFlightRequestThenStops proves that
+// canceling the context (standing in for a SIGTERM from Docker/Kubernetes)
+// makes runWithGracefulShutdown call e.Shutdown rather than dropping
+// connections outright: a request already in flight is given time to finish
+// and receives its full response, and the listener is closed afterward so
+// new connections are refused.
+func TestRunWithGracefulShutdown_WaitsForInFlightRequestThenStops(t *testing.T) {
+	resetSearcherState(t)
+	e := newEcho()
+
+	inHandler := make(chan struct{})
+	release := make(chan struct{})
+	e.GET("/slow-for-test", func(c echo.Context) error {
+		close(inHandler)
+		<-release
+		return c.String(http.StatusOK, "done")
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	e.Listener = ln
+	addr := ln.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- runWithGracefulShutdown(ctx, e, func() error { return e.Start("") })
+	}()
+
+	reqDone := make(chan struct{})
+	var reqErr error
+	var reqStatus int
+	go func() {
+		defer close(reqDone)
+		resp, err := http.Get("http://" + addr + "/slow-for-test")
+		if err != nil {
+			reqErr = err
+			return
+		}
+		defer resp.Body.Close()
+		reqStatus = resp.StatusCode
+	}()
+
+	select {
+	case <-inHandler:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler was never invoked")
+	}
+
+	// Cancel while the handler is still blocked mid-request, then let it
+	// finish shortly after. A non-graceful shutdown would have severed the
+	// connection the moment ctx was canceled, before the handler releases.
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	select {
+	case <-reqDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight request never completed")
+	}
+	if reqErr != nil {
+		t.Fatalf("in-flight request failed instead of completing gracefully: %v", reqErr)
+	}
+	if reqStatus != http.StatusOK {
+		t.Fatalf("in-flight request status = %d, want %d", reqStatus, http.StatusOK)
+	}
+
+	select {
+	case err := <-runErr:
+		if !errors.Is(err, http.ErrServerClosed) {
+			t.Fatalf("runWithGracefulShutdown error = %v, want http.ErrServerClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runWithGracefulShutdown never returned")
+	}
+
+	if _, err := net.DialTimeout("tcp", addr, 500*time.Millisecond); err == nil {
+		t.Fatal("listener still accepting connections after shutdown")
 	}
 }
 
