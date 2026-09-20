@@ -1,14 +1,30 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	cpb "github.com/danielkhasanov/wordcube/gen/proto/v1"
+	"github.com/danielkhasanov/wordcube/psolve"
 	"github.com/labstack/echo/v4"
 )
+
+// newFixtureSearcher builds a tiny real Searcher over a hand-built,
+// symmetric 5x5 word square (grid[i][j] == grid[j][i], so rows and columns
+// read as the same words) so /solutions can be exercised end-to-end without
+// depending on the real app/data/solutions.textpb corpus.
+func newFixtureSearcher() *psolve.Searcher {
+	words := []string{"afghi", "fbjkl", "gjcmn", "hkmdo", "ilnoe"}
+	ss := &cpb.SolutionSet{
+		Dictionary: &cpb.Dictionary{Word: words},
+		Solutions:  []*cpb.Square{{Word: []int32{0, 1, 2, 3, 4}}},
+	}
+	return psolve.NewSearcher(ss)
+}
 
 // resetSearcherState ensures tests don't leak global searcher state into
 // each other; searcher/searcherReady are process-wide globals set by
@@ -146,6 +162,67 @@ func TestSecurityHeaders_Present(t *testing.T) {
 	for header, want := range wantHeaders {
 		if got := rec.Header().Get(header); got != want {
 			t.Errorf("header %s = %q, want %q", header, got, want)
+		}
+	}
+}
+
+func TestSolutionsHandler_StreamsMatchingSolutionAsNDJSON(t *testing.T) {
+	resetSearcherState(t)
+	searcher = newFixtureSearcher()
+	searcherReady = true
+	e := newEcho()
+
+	// Only constrain the top-left cell; the fixture has exactly one
+	// solution, and this exercises the real key-index/intersection path
+	// (not just the "no keys" / not-ready shortcuts other tests cover).
+	body := strings.NewReader(`{"board":[["a","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"],["_","_","_","_","_"]]}`)
+	req := httptest.NewRequest(http.MethodPost, "/solutions", body)
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var solutions []Solution
+	scanner := bufio.NewScanner(rec.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		var sol Solution
+		if err := json.Unmarshal([]byte(line), &sol); err != nil {
+			t.Fatalf("failed to unmarshal NDJSON line %q: %v", line, err)
+		}
+		solutions = append(solutions, sol)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("error scanning response body: %v", err)
+	}
+
+	if len(solutions) != 1 {
+		t.Fatalf("got %d streamed solutions, want 1: %+v", len(solutions), solutions)
+	}
+
+	wantGrid := [][]string{
+		{"a", "f", "g", "h", "i"},
+		{"f", "b", "j", "k", "l"},
+		{"g", "j", "c", "m", "n"},
+		{"h", "k", "m", "d", "o"},
+		{"i", "l", "n", "o", "e"},
+	}
+	got := solutions[0]
+	if got.ID != 1 {
+		t.Errorf("solution ID = %d, want 1", got.ID)
+	}
+	if len(got.Grid) != len(wantGrid) {
+		t.Fatalf("grid has %d rows, want %d", len(got.Grid), len(wantGrid))
+	}
+	for i := range wantGrid {
+		if strings.Join(got.Grid[i], "") != strings.Join(wantGrid[i], "") {
+			t.Errorf("row %d = %v, want %v", i, got.Grid[i], wantGrid[i])
 		}
 	}
 }
