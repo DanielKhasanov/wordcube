@@ -55,7 +55,6 @@ type Trie struct {
 	Cache      map[uint64][]*RuneSlice // key is Hash(), value includes full RuneSlice for equality check
 	CacheHits  int
 	wordlength int
-	walkedNode *TrieNode
 }
 
 // NewTrie creates a new Trie.
@@ -69,7 +68,6 @@ func NewTrie(wordlength int) (*Trie, error) {
 		root:       root,
 		Cache:      make(map[uint64][]*RuneSlice),
 		wordlength: wordlength,
-		walkedNode: root,
 	}, nil
 }
 
@@ -145,23 +143,35 @@ func searchWithWildcardHelper(node *TrieNode, pattern *RuneSlice, index int, cur
 	return nil
 }
 
-func (t *Trie) WalkIn(r rune) bool {
-	node := t.walkedNode.children[r-'a']
+// Walker independently tracks a position while walking a Trie, so multiple
+// walks of the same Trie can proceed concurrently without interfering with
+// each other or duplicating the underlying node graph.
+type Walker struct {
+	walkedNode *TrieNode
+}
+
+// NewWalker returns a Walker positioned at the root of the Trie.
+func (t *Trie) NewWalker() *Walker {
+	return &Walker{walkedNode: t.root}
+}
+
+func (w *Walker) WalkIn(r rune) bool {
+	node := w.walkedNode.children[r-'a']
 	if node == nil {
 		return false
 	}
-	t.walkedNode = node
+	w.walkedNode = node
 	return true
 }
 
-func (t *Trie) WalkOut() {
-	node := t.walkedNode.parent
+func (w *Walker) WalkOut() {
+	node := w.walkedNode.parent
 	if node == nil {
 		return
 	}
-	t.walkedNode = node
+	w.walkedNode = node
 }
 
-func (t *Trie) Depth() int {
-	return t.walkedNode.depth
+func (w *Walker) Depth() int {
+	return w.walkedNode.depth
 }
