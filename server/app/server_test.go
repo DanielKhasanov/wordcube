@@ -282,6 +282,8 @@ func TestSecurityHeaders_Present(t *testing.T) {
 	wantHeaders := map[string]string{
 		"X-Content-Type-Options": "nosniff",
 		"X-Frame-Options":        "DENY",
+		"Referrer-Policy":        "no-referrer",
+		"Permissions-Policy":     "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()",
 	}
 	for header, want := range wantHeaders {
 		if got := rec.Header().Get(header); got != want {

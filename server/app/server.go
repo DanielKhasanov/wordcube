@@ -237,7 +237,23 @@ func newEcho() *echo.Echo {
 		XFrameOptions:         "DENY",
 		HSTSMaxAge:            31536000,
 		ContentSecurityPolicy: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+		// The app never sends cross-origin requests and has no reason for a
+		// browser to forward this site's URLs (which may embed a partially
+		// filled-in board as query/path data in future features) to another
+		// origin via the Referer header.
+		ReferrerPolicy: "no-referrer",
 	}))
+	// The frontend is a static word-grid UI with no use for camera,
+	// microphone, geolocation, or other permission-gated browser APIs (see
+	// site/src: no navigator.* feature usage). Denying them via
+	// Permissions-Policy is defense-in-depth against a future XSS or a
+	// compromised/typosquatted dependency trying to invoke them.
+	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			c.Response().Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()")
+			return next(c)
+		}
+	})
 	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
 		AllowOrigins: allowedOrigins(),
 		AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodOptions},

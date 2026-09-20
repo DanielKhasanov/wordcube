@@ -99,8 +99,10 @@ preserve existing dev/Codespaces behavior out of the box.
   container port `1323` (or whatever `PORT` is set to).
 
 These, along with connection timeouts, security headers (`X-Content-Type-Options`,
-`X-Frame-Options`, HSTS), a 64K request body limit, and panic recovery, are covered
-by the test suite in `server/app/server_test.go`.
+`X-Frame-Options`, HSTS, `Referrer-Policy: no-referrer`, and a locked-down
+`Permissions-Policy` denying camera/microphone/geolocation/payment/usb/FLoC), a 64K
+request body limit, and panic recovery, are covered by the test suite in
+`server/app/server_test.go`.
 
 ### Content-Security-Policy
 
