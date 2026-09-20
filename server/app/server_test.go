@@ -370,16 +370,15 @@ func TestSolutionsHandler_StreamsMatchingSolutionAsNDJSON(t *testing.T) {
 	}
 }
 
-// TestSolutionsHandler_SearchErrorReturns500NotSilent200 exercises the path
-// where the underlying search itself errors (as opposed to "zero solutions
-// match" - a query board can name a letter/position combination that has no
-// entry at all in the key index, which FindMatchingSolutions surfaces as an
-// error, not an empty result set). The handler must report that as a 500,
-// not a 200 with an empty body, since streamSolutions previously wrote the
-// 200 status header before calling FindMatchingSolutions - by the time the
-// error was known, the response was already committed and the real error
-// was silently swallowed into what looked like a successful empty result.
-func TestSolutionsHandler_SearchErrorReturns500NotSilent200(t *testing.T) {
+// TestSolutionsHandler_UnmatchableLetterReturns200WithNoSolutions exercises a
+// query board that names a letter/row/column combination with no entry at
+// all in the key index (as opposed to an entry whose value set just doesn't
+// intersect with anything). This is an entirely normal outcome of interactive
+// use - a user can type a letter into a cell for which no valid word square
+// exists - and previously (see git history) got misclassified as a search
+// failure and reported as a 500, meaning the UI showed a hard error on what
+// is really just "zero solutions match your current input".
+func TestSolutionsHandler_UnmatchableLetterReturns200WithNoSolutions(t *testing.T) {
 	resetSearcherState(t)
 	searcherState.Store(newFixtureSearcher())
 	e := newEcho()
@@ -393,11 +392,11 @@ func TestSolutionsHandler_SearchErrorReturns500NotSilent200(t *testing.T) {
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status code = %d, want %d (body = %q)", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d (body = %q)", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if strings.Contains(rec.Body.String(), "indexed solutions for key") {
-		t.Fatalf("response body leaked internal search-index error detail: %q", rec.Body.String())
+	if strings.TrimSpace(rec.Body.String()) != "" {
+		t.Fatalf("response body = %q, want empty (no matching solutions)", rec.Body.String())
 	}
 }
 

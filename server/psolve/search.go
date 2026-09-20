@@ -180,17 +180,27 @@ func (s *Searcher) noCopyIntersection(ctx context.Context, solutionSets []Soluti
 	return solutionChan
 }
 
+// noMatchesForKey is a shared empty SolutionSet used whenever a queried
+// key/keyVal has no entry in the index at all. That simply means no solution
+// contains that letter at that row/column - a normal "zero results" outcome
+// (e.g. the user typed a letter into a position no valid word square can
+// fill), not a search failure - so it's folded into the intersection like
+// any other (empty) constraint rather than treated as an error.
+var noMatchesForKey = SolutionSet{}
+
 func (s *Searcher) filterSolutionsByKey(ctx context.Context, keys map[int]int) (SolutionChan, error) {
 	solutionSets := []SolutionSet{}
 	// TODO, when there are no keys, the grid is empty and we should stream all solutions.
 	for key, keyVal := range keys {
 		indexedSolutions, exists := s.keyIndexedSolutions[key]
 		if !exists {
-			return nil, fmt.Errorf("no indexed solutions for key: %s", s.keyString(key))
+			solutionSets = append(solutionSets, noMatchesForKey)
+			continue
 		}
 		matchingSolutions, exists := indexedSolutions[keyVal]
 		if !exists {
-			return nil, fmt.Errorf("no matching keyVal for key %s", s.keyString(key))
+			solutionSets = append(solutionSets, noMatchesForKey)
+			continue
 		}
 		solutionSets = append(solutionSets, matchingSolutions)
 	}
