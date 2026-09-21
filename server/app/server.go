@@ -174,6 +174,39 @@ func newTLSConfig() *tls.Config {
 	}
 }
 
+// newTLSServer builds the *http.Server that main() starts for HTTPS,
+// loading certFile/keyFile and applying newTLSConfig()'s hardening to it.
+// This is factored out of main() - rather than calling Echo's own
+// e.StartTLS(addr, certFile, keyFile) - because e.StartTLS unconditionally
+// replaces e.TLSServer.TLSConfig with a fresh, unhardened tls.Config{} that
+// only carries the loaded certificate (see the vendored echo.go: `s.TLSConfig
+// = new(tls.Config)`), discarding any MinVersion/CipherSuites set on it
+// beforehand. That would silently throw away newTLSConfig()'s hardening the
+// moment TLS is actually enabled, even though newTLSConfig() itself is
+// well-tested in isolation (via httptest.Server, which does respect a
+// pre-set TLS field). Loading the certificate here and starting the result
+// with e.StartServer instead - which respects a pre-set TLSConfig - keeps the
+// hardening in the real startup path, not just in tests that construct the
+// config directly.
+func newTLSServer(e *echo.Echo, addr, certFile, keyFile string) (*http.Server, error) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+	tlsConfig := newTLSConfig()
+	tlsConfig.Certificates = []tls.Certificate{cert}
+	if !e.DisableHTTP2 {
+		tlsConfig.NextProtos = append(tlsConfig.NextProtos, "h2")
+	}
+	e.TLSServer.Addr = addr
+	e.TLSServer.TLSConfig = tlsConfig
+	e.TLSServer.ReadHeaderTimeout = readHeaderTimeout
+	e.TLSServer.ReadTimeout = readTimeout
+	e.TLSServer.WriteTimeout = writeTimeout
+	e.TLSServer.IdleTimeout = idleTimeout
+	return e.TLSServer, nil
+}
+
 // listenAddr returns the ":<port>" address the server binds to. It honors
 // the PORT env var (docker-compose.yml has set this since the container was
 // first written, but server.go never read it - the listener was always
@@ -331,12 +364,11 @@ func main() {
 	certFile := os.Getenv("TLS_CERT_FILE")
 	keyFile := os.Getenv("TLS_KEY_FILE")
 	if certFile != "" && keyFile != "" {
-		e.TLSServer.ReadHeaderTimeout = readHeaderTimeout
-		e.TLSServer.ReadTimeout = readTimeout
-		e.TLSServer.WriteTimeout = writeTimeout
-		e.TLSServer.IdleTimeout = idleTimeout
-		e.TLSServer.TLSConfig = newTLSConfig()
-		startFn = func() error { return e.StartTLS(addr, certFile, keyFile) }
+		s, err := newTLSServer(e, addr, certFile, keyFile)
+		if err != nil {
+			e.Logger.Fatal(err)
+		}
+		startFn = func() error { return e.StartServer(s) }
 	} else {
 		log.Println("TLS_CERT_FILE/TLS_KEY_FILE not set; serving plain HTTP. Terminate TLS here or at a reverse proxy in production.")
 		startFn = func() error { return e.Start(addr) }

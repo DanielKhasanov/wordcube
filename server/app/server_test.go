@@ -3,9 +3,15 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -856,6 +862,119 @@ func TestTLSConfig_RejectsCBCCipherSuites(t *testing.T) {
 			t.Fatalf("status code = %d, want %d", resp.StatusCode, http.StatusOK)
 		}
 	})
+}
+
+// generateSelfSignedCertFiles writes a throwaway RSA self-signed cert/key
+// pair as PEM files under t.TempDir(), for tests that need real file paths
+// (as newTLSServer/tls.LoadX509KeyPair require) rather than an in-memory
+// tls.Certificate. RSA is used specifically so a single cert satisfies both
+// the ECDHE_RSA_* CBC and ECDHE_RSA_* AEAD suites exercised below, without
+// key-type mismatches masking what's actually being tested.
+func generateSelfSignedCertFiles(t *testing.T) (certFile, keyFile string) {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate: %v", err)
+	}
+
+	dir := t.TempDir()
+	certFile = dir + "/cert.pem"
+	keyFile = dir + "/key.pem"
+
+	certOut, err := os.Create(certFile)
+	if err != nil {
+		t.Fatalf("create cert file: %v", err)
+	}
+	defer certOut.Close()
+	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
+		t.Fatalf("pem encode cert: %v", err)
+	}
+
+	keyOut, err := os.Create(keyFile)
+	if err != nil {
+		t.Fatalf("create key file: %v", err)
+	}
+	defer keyOut.Close()
+	if err := pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)}); err != nil {
+		t.Fatalf("pem encode key: %v", err)
+	}
+
+	return certFile, keyFile
+}
+
+// TestNewTLSServer_HardeningAppliesToRealStartupPath proves that the exact
+// *http.Server main() builds via newTLSServer and starts via e.StartServer
+// enforces newTLSConfig()'s hardening (TLS 1.2+, AEAD-only cipher suites).
+// The other TLS tests in this file (tlsTestServer, via httptest.Server.TLS)
+// prove newTLSConfig() is correct in isolation, but httptest respects a
+// pre-set TLS field the way Echo's own e.StartTLS does not - so they never
+// would have caught e.StartTLS silently discarding that hardening in the
+// real main() startup path. This test goes through newTLSServer +
+// e.StartServer exactly as main() does, so it would have failed against the
+// pre-fix code (which called e.StartTLS instead).
+func TestNewTLSServer_HardeningAppliesToRealStartupPath(t *testing.T) {
+	resetSearcherState(t)
+	certFile, keyFile := generateSelfSignedCertFiles(t)
+
+	e := newEcho()
+	s, err := newTLSServer(e, "127.0.0.1:0", certFile, keyFile)
+	if err != nil {
+		t.Fatalf("newTLSServer: %v", err)
+	}
+
+	// Bind and wrap the TLS listener here ourselves - mirroring how
+	// TestRunWithGracefulShutdown_WaitsForInFlightRequestThenStops pre-sets
+	// e.Listener - so the bound address is known synchronously. Polling
+	// e.TLSListener from this goroutine after starting e.StartServer in a
+	// background goroutine would otherwise race configureServer's write to
+	// it (caught by -race).
+	ln, err := net.Listen("tcp", s.Addr)
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	e.TLSListener = tls.NewListener(ln, s.TLSConfig)
+	addr := ln.Addr().String()
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- e.StartServer(s) }()
+	t.Cleanup(func() { _ = e.Close() })
+
+	dial := func(cfg *tls.Config) error {
+		cfg.InsecureSkipVerify = true //nolint:gosec // test-only, dialing our own self-signed cert
+		client := &http.Client{Transport: &http.Transport{TLSClientConfig: cfg}}
+		resp, err := client.Get("https://" + addr + "/status")
+		if err != nil {
+			return err
+		}
+		return resp.Body.Close()
+	}
+
+	if err := dial(&tls.Config{MaxVersion: tls.VersionTLS11}); err == nil {
+		t.Fatal("handshake capped at TLS 1.1 unexpectedly succeeded against the real main() startup path")
+	}
+	if err := dial(&tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		MaxVersion:   tls.VersionTLS12,
+		CipherSuites: []uint16{tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA, tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA},
+	}); err == nil {
+		t.Fatal("CBC-only handshake unexpectedly succeeded against the real main() startup path")
+	}
+	if err := dial(&tls.Config{MinVersion: tls.VersionTLS12}); err != nil {
+		t.Fatalf("TLS 1.2+ handshake against the real main() startup path failed: %v", err)
+	}
 }
 
 // TestConcurrentReadinessPublishHasNoDataRace exercises the exact concurrency
