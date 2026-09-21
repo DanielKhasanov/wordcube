@@ -1,0 +1,9 @@
+# no-mistakes repository configuration.
+# Reference: https://kunchenguid.github.io/no-mistakes/reference/repo-config/
+
+# This repo has no CI workflows configured (no .github/workflows). Without
+# this declaration, no-mistakes's CI-monitor step waits indefinitely for
+# checks that will never register on any PR. Must live on this trusted
+# default-branch copy of the file - a feature branch cannot declare this for
+# itself.
+no_ci: true
