@@ -224,8 +224,8 @@ func listenAddr() string {
 	return ":" + port
 }
 
-// runWithGracefulShutdown runs startFn (an e.Start/e.StartTLS call, which
-// blocks until the listener stops or errors) and, when ctx is canceled (a
+// runWithGracefulShutdown runs startFn (an e.Start or e.StartServer call,
+// which blocks until the listener stops or errors) and, when ctx is canceled (a
 // SIGINT/SIGTERM), calls e.Shutdown so in-flight requests - including
 // streaming /solutions responses - get up to shutdownTimeout to finish
 // instead of having their connections killed outright. This matters because
