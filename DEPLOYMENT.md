@@ -159,8 +159,8 @@ The Dockerfile uses a multi-stage build process:
 
 ## API Endpoints
 
-- `GET /solutions` - Get solutions for an empty board
-- `POST /solutions` - Get solutions for a specific board state
+- `POST /solutions` - Streams matching solutions (NDJSON) for a given board state
+- `GET /status` - Readiness check and precomputed solution count
 - `GET /` - Serves the frontend application
 
 ## Environment
