@@ -4,32 +4,87 @@ import { Solution } from '../types/api';
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 const SOLUTIONS_ENDPOINT = `${API_BASE_URL}/solutions`;
 
+// The backend loads and indexes its multi-million-row solution set in a
+// background goroutine at startup (see GET /status) and returns 503 from
+// /solutions until that finishes - a normal, expected window (observed to
+// last several seconds against the real solutions.textpb), not a failure.
+// Retry after a short delay instead of surfacing it as an error.
+const NOT_READY_RETRY_DELAY_MS = 1000;
+
+// If the backend's searcher never finishes initializing (e.g. a missing or
+// corrupt solutions.textpb causes initializeSearcher to fail permanently -
+// see server/app/server.go), GET /status and POST /solutions both stay in
+// the "not ready" state forever with no way for the client to distinguish
+// that from "still loading". Without a cap, useSolutions would retry every
+// NOT_READY_RETRY_DELAY_MS indefinitely, leaving the UI stuck on a loading
+// spinner forever with no indication anything is wrong. Cap the retries and
+// surface a real error once exceeded.
+const MAX_NOT_READY_RETRIES = 30;
+
+// JSON.parse only proves a line is syntactically valid JSON, not that it has
+// the Solution shape - a bare `as Solution` cast after parsing is a
+// compile-time-only assertion with zero runtime effect, so a structurally
+// wrong but still-valid-JSON line (e.g. a proxy/CDN error page fragment, a
+// future incompatible API response, or a corrupted byte range) would flow
+// straight into React state unchecked. Since there is no error boundary
+// anywhere in this app (confirmed via a repo-wide search), a downstream
+// component indexing into a malformed grid (e.g. WordSquare assuming 5x5
+// string[][]) would crash the whole render tree rather than fail gracefully.
+// Validate the shape at the network boundary, symmetric with the board input
+// validation already enforced server-side (see validateBoardCells in
+// server/app/server.go).
+function isSolution(value: unknown): value is Solution {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  if (typeof candidate.id !== 'number') {
+    return false;
+  }
+  if (!Array.isArray(candidate.grid)) {
+    return false;
+  }
+  return candidate.grid.every(
+    (row) => Array.isArray(row) && row.every((cell) => typeof cell === 'string')
+  );
+}
+
 export function useSolutions(board?: string[][]) {
   const [solutions, setSolutions] = useState<Solution[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
 
   useEffect(() => {
-    let isCancelled = false;
-    
+    const controller = new AbortController();
+    let retryTimeout: ReturnType<typeof setTimeout> | undefined;
+    let notReadyRetries = 0;
+
     const fetchSolutions = async () => {
-      setIsLoading(true);
-      setError(null);
-      setSolutions([]);
-      
+      let retrying = false;
       try {
         const requestBody = {
           board: board || Array(5).fill(null).map(() => Array(5).fill(''))
         };
-                
+
         const response = await fetch(SOLUTIONS_ENDPOINT, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify(requestBody),
+          signal: controller.signal,
         });
-        
+
+        if (response.status === 503) {
+          notReadyRetries += 1;
+          if (notReadyRetries > MAX_NOT_READY_RETRIES) {
+            throw new Error('Solutions failed to load. Please refresh the page and try again.');
+          }
+          retrying = true;
+          retryTimeout = setTimeout(fetchSolutions, NOT_READY_RETRY_DELAY_MS);
+          return;
+        }
+
         if (!response.ok) {
           throw new Error('Failed to fetch solutions');
         }
@@ -45,27 +100,27 @@ export function useSolutions(board?: string[][]) {
         try {
           while (true) {
             const { done, value } = await reader.read();
-            
+
             if (done) {
               break;
             }
-            
-            if (isCancelled) {
-              break;
-            }
-            
+
             buffer += decoder.decode(value, { stream: true });
-            
+
             // Split by newlines and process each complete JSON object
             const lines = buffer.split('\n');
             buffer = lines.pop() || ''; // Keep the last incomplete line
-            
+
             for (const line of lines) {
               if (line.trim()) {
                 try {
-                  const solution = JSON.parse(line.trim()) as Solution;
+                  const parsed: unknown = JSON.parse(line.trim());
+                  if (!isSolution(parsed)) {
+                    console.warn('Skipping malformed solution:', line);
+                    continue;
+                  }
                   // Add solution immediately to trigger re-render
-                  setSolutions(prev => [...prev, solution]);
+                  setSolutions(prev => [...prev, parsed]);
                 } catch (e) {
                   console.warn('Failed to parse solution:', line, e);
                 }
@@ -76,20 +131,25 @@ export function useSolutions(board?: string[][]) {
           reader.releaseLock();
         }
       } catch (err) {
-        if (!isCancelled) {
-          setError(err instanceof Error ? err : new Error('Unknown error'));
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          return;
         }
+        setError(err instanceof Error ? err : new Error('Unknown error'));
       } finally {
-        if (!isCancelled) {
+        if (!retrying && !controller.signal.aborted) {
           setIsLoading(false);
         }
       }
     };
 
+    setIsLoading(true);
+    setError(null);
+    setSolutions([]);
     fetchSolutions();
 
     return () => {
-      isCancelled = true;
+      controller.abort();
+      clearTimeout(retryTimeout);
     };
   }, [board]); // Add board as dependency
 

@@ -21,6 +21,7 @@ A full-stack word-square ("wordcube") solver: a Go backend that exhaustively fin
 - Dev server: `cd site && npm run dev` (point `VITE_API_BASE_URL` at the running backend, e.g. via `site/.env.local`; see `site/.env.example`)
 - Type-check + production build: `cd site && npm run build`
 - Lint: `cd site && npm run lint`
+- Test: `cd site && npm test` (Vitest + Testing Library; currently covers the `useSolutions` networking hook in `src/hooks/useSolutions.test.ts`)
 
 ### Whole-app
 - One-time local setup: `./dev-setup.sh`

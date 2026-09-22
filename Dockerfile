@@ -11,7 +11,7 @@ COPY site/ ./
 RUN npm run build
 
 # Stage 2: Build the Go server
-FROM golang:1.24-alpine AS backend-builder
+FROM golang:1.25-alpine AS backend-builder
 
 WORKDIR /app
 COPY server/go.mod server/go.sum ./
@@ -43,6 +43,12 @@ FROM alpine:latest
 RUN apk --no-cache add ca-certificates
 RUN mkdir /app
 
+# Run as an unprivileged, non-login user instead of the container default
+# (root) - the Go binary never needs root privileges, and a shell/CGI/RCE-style
+# bug in it (or in a dependency) shouldn't hand an attacker root inside the
+# container.
+RUN addgroup -S wordcube && adduser -S -G wordcube -H wordcube
+
 WORKDIR /app
 
 # Copy the built Go binary
@@ -53,6 +59,9 @@ COPY --from=frontend-builder /app/site/dist ./static
 
 # Copy server data files
 COPY --from=backend-builder /app/app/data ./app/data
+
+RUN chown -R wordcube:wordcube /app
+USER wordcube
 
 # Expose port 1323 (the port your Go server runs on)
 EXPOSE 1323

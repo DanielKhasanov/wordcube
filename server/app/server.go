@@ -3,16 +3,46 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/danielkhasanov/wordcube/psolve"
 	"github.com/danielkhasanov/wordcube/reader"
 	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"golang.org/x/time/rate"
+)
+
+const (
+	defaultPort = "1323"
+
+	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 10 * time.Second
+	writeTimeout      = 30 * time.Second
+	idleTimeout       = 120 * time.Second
+
+	// shutdownTimeout bounds how long a graceful shutdown waits for
+	// in-flight requests (including streaming /solutions responses) to
+	// finish before forcibly closing remaining connections.
+	shutdownTimeout = 10 * time.Second
+
+	// defaultSolutionsRateLimit and defaultSolutionsRateBurst bound how
+	// often a single client IP may hit the expensive /solutions search
+	// endpoint (each request walks the inverted index and streams
+	// results), guarding against accidental or malicious hammering.
+	defaultSolutionsRateLimit = 5
+	defaultSolutionsRateBurst = 10
 )
 
 type (
@@ -26,12 +56,17 @@ type (
 	}
 )
 
-var (
-	// Global searcher for finding solutions
-	searcher *psolve.Searcher
-	// Flag to track if searcher is ready
-	searcherReady bool
-)
+// searcherState holds the current *psolve.Searcher, or nil while solutions
+// are still loading. It is set once by initializeSearcher's background
+// goroutine in main() and read concurrently by every /solutions and /status
+// request handler; a plain (searcher *psolve.Searcher, searcherReady bool)
+// pair of package globals here would be an unsynchronized concurrent
+// read/write - a data race under the Go memory model, and one where a
+// request could plausibly observe searcherReady=true before the searcher
+// write is visible. atomic.Pointer makes "ready" and "which searcher" a
+// single atomically-published value, so there's no window where one is
+// updated without the other.
+var searcherState atomic.Pointer[psolve.Searcher]
 
 // initializeSearcher loads solutions from textpb file and creates a searcher
 func initializeSearcher() error {
@@ -43,10 +78,266 @@ func initializeSearcher() error {
 		return fmt.Errorf("failed to load solutions: %v", err)
 	}
 
-	searcher = psolve.NewSearcher(solutionSet)
-	searcherReady = true
+	searcherState.Store(psolve.NewSearcher(solutionSet))
 	fmt.Printf("Searcher initialized with %d solutions\n", len(solutionSet.GetSolutions()))
 	return nil
+}
+
+// allowedOrigins returns the CORS origin allowlist. It defaults to "*" to
+// preserve existing behavior (the frontend may be served from an arbitrary
+// dev-environment URL), but operators can lock this down in production via
+// the ALLOWED_ORIGINS env var (comma-separated). Entries are trimmed so a
+// stray space after a comma (e.g. "https://a.com, https://b.com") doesn't
+// silently produce an origin string that will never match a real Origin
+// header, which would otherwise leave the second entry permanently unusable.
+func allowedOrigins() []string {
+	v := os.Getenv("ALLOWED_ORIGINS")
+	if v == "" {
+		return []string{"*"}
+	}
+	origins := strings.Split(v, ",")
+	for i, o := range origins {
+		origins[i] = strings.TrimSpace(o)
+	}
+	return origins
+}
+
+// solutionsRateLimiterMiddleware rate limits POST /solutions per client IP
+// using a token-bucket algorithm (golang.org/x/time/rate, via Echo's
+// RateLimiterMemoryStore), since each request runs a real search against
+// the in-memory index rather than serving static/cheap content. Limits are
+// configurable via RATE_LIMIT_RPS/RATE_LIMIT_BURST for operators who need to
+// tune them, defaulting to a conservative per-IP allowance.
+func solutionsRateLimiterMiddleware() echo.MiddlewareFunc {
+	rps := defaultSolutionsRateLimit
+	if v := os.Getenv("RATE_LIMIT_RPS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			rps = parsed
+		}
+	}
+	burst := defaultSolutionsRateBurst
+	if v := os.Getenv("RATE_LIMIT_BURST"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			burst = parsed
+		}
+	}
+	store := middleware.NewRateLimiterMemoryStoreWithConfig(middleware.RateLimiterMemoryStoreConfig{
+		Rate:  rate.Limit(rps),
+		Burst: burst,
+	})
+	return middleware.RateLimiterWithConfig(middleware.RateLimiterConfig{
+		Store: store,
+	})
+}
+
+// ipExtractor returns how Echo (and the /solutions rate limiter, which keys
+// off c.RealIP()) determines a client's IP. It defaults to the raw TCP
+// connection address (echo.ExtractIPDirect): trusting the X-Forwarded-For/
+// X-Real-IP headers by default would let any client bypass per-IP rate
+// limiting simply by sending a different header value on every request,
+// since this app has no reverse proxy in front of it out of the box (see
+// DEPLOYMENT.md). Operators who do deploy behind a trusted reverse proxy on
+// their private network can opt in via TRUST_PROXY_HEADERS=true.
+func ipExtractor() echo.IPExtractor {
+	if os.Getenv("TRUST_PROXY_HEADERS") == "true" {
+		return echo.ExtractIPFromXFFHeader()
+	}
+	return echo.ExtractIPDirect()
+}
+
+// newTLSConfig returns the tls.Config used for the server's HTTPS listener.
+// It is factored out from main() so tests can exercise the exact production
+// config (rather than a hand-copied approximation) against a real TLS
+// handshake. MinVersion excludes TLS 1.0/1.1, which are both deprecated
+// (RFC 8996) and vulnerable to downgrade/BEAST-style attacks.
+//
+// CipherSuites is restricted to AEAD-only suites (AES-GCM and
+// ChaCha20-Poly1305). Go's default TLS 1.2 cipher list (used when
+// CipherSuites is nil) also includes several CBC-mode suites for
+// compatibility with older clients; CBC in TLS 1.2 has a history of
+// padding-oracle/timing attacks (e.g. Lucky13), so this app - which has no
+// legacy client compatibility requirement - drops them rather than
+// negotiating a weaker mode when a client offers it. This only affects TLS
+// 1.2 negotiation: Go's TLS 1.3 implementation always uses its own fixed set
+// of AEAD cipher suites and ignores CipherSuites entirely.
+func newTLSConfig() *tls.Config {
+	return &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		},
+	}
+}
+
+// newTLSServer builds the *http.Server that main() starts for HTTPS,
+// loading certFile/keyFile and applying newTLSConfig()'s hardening to it.
+// This is factored out of main() - rather than calling Echo's own
+// e.StartTLS(addr, certFile, keyFile) - because e.StartTLS unconditionally
+// replaces e.TLSServer.TLSConfig with a fresh, unhardened tls.Config{} that
+// only carries the loaded certificate (see the vendored echo.go: `s.TLSConfig
+// = new(tls.Config)`), discarding any MinVersion/CipherSuites set on it
+// beforehand. That would silently throw away newTLSConfig()'s hardening the
+// moment TLS is actually enabled, even though newTLSConfig() itself is
+// well-tested in isolation (via httptest.Server, which does respect a
+// pre-set TLS field). Loading the certificate here and starting the result
+// with e.StartServer instead - which respects a pre-set TLSConfig - keeps the
+// hardening in the real startup path, not just in tests that construct the
+// config directly.
+func newTLSServer(e *echo.Echo, addr, certFile, keyFile string) (*http.Server, error) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+	tlsConfig := newTLSConfig()
+	tlsConfig.Certificates = []tls.Certificate{cert}
+	if !e.DisableHTTP2 {
+		tlsConfig.NextProtos = append(tlsConfig.NextProtos, "h2")
+	}
+	e.TLSServer.Addr = addr
+	e.TLSServer.TLSConfig = tlsConfig
+	e.TLSServer.ReadHeaderTimeout = readHeaderTimeout
+	e.TLSServer.ReadTimeout = readTimeout
+	e.TLSServer.WriteTimeout = writeTimeout
+	e.TLSServer.IdleTimeout = idleTimeout
+	return e.TLSServer, nil
+}
+
+// listenAddr returns the ":<port>" address the server binds to. It honors
+// the PORT env var (docker-compose.yml has set this since the container was
+// first written, but server.go never read it - the listener was always
+// hardcoded to :1323 regardless of PORT's value) and falls back to
+// defaultPort when PORT is unset or not a valid port number.
+func listenAddr() string {
+	port := os.Getenv("PORT")
+	if port == "" {
+		return ":" + defaultPort
+	}
+	if n, err := strconv.Atoi(port); err != nil || n <= 0 || n > 65535 {
+		log.Printf("PORT=%q is not a valid port number; falling back to :%s", port, defaultPort)
+		return ":" + defaultPort
+	}
+	return ":" + port
+}
+
+// runWithGracefulShutdown runs startFn (an e.Start or e.StartServer call,
+// which blocks until the listener stops or errors) and, when ctx is canceled (a
+// SIGINT/SIGTERM), calls e.Shutdown so in-flight requests - including
+// streaming /solutions responses - get up to shutdownTimeout to finish
+// instead of having their connections killed outright. This matters because
+// container orchestrators (Docker, Kubernetes) send SIGTERM on stop/restart,
+// and without this the default net/http behavior is to close all
+// connections immediately.
+func runWithGracefulShutdown(ctx context.Context, e *echo.Echo, startFn func() error) error {
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- startFn()
+	}()
+
+	select {
+	case err := <-serveErr:
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := e.Shutdown(shutdownCtx); err != nil {
+			return err
+		}
+		return <-serveErr
+	}
+}
+
+// newEcho builds the Echo instance with all middleware and routes
+// registered, without starting a listener. This keeps route/middleware
+// wiring independently testable via httptest.
+func newEcho() *echo.Echo {
+	e := echo.New()
+	e.HideBanner = true
+	e.IPExtractor = ipExtractor()
+
+	// Recover must run first so a panic in any handler returns a 500
+	// instead of crashing the whole process.
+	e.Use(middleware.Recover())
+	e.Use(middleware.Logger())
+	e.Use(middleware.SecureWithConfig(middleware.SecureConfig{
+		XSSProtection:         "1; mode=block",
+		ContentTypeNosniff:    "nosniff",
+		XFrameOptions:         "DENY",
+		HSTSMaxAge:            31536000,
+		ContentSecurityPolicy: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+		// The app never sends cross-origin requests and has no reason for a
+		// browser to forward this site's URLs (which may embed a partially
+		// filled-in board as query/path data in future features) to another
+		// origin via the Referer header.
+		ReferrerPolicy: "no-referrer",
+	}))
+	// The frontend is a static word-grid UI with no use for camera,
+	// microphone, geolocation, or other permission-gated browser APIs (see
+	// site/src: no navigator.* feature usage). Denying them via
+	// Permissions-Policy is defense-in-depth against a future XSS or a
+	// compromised/typosquatted dependency trying to invoke them.
+	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			c.Response().Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()")
+			return next(c)
+		}
+	})
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins: allowedOrigins(),
+		AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodOptions},
+		AllowHeaders: []string{echo.HeaderContentType},
+	}))
+	// The board payload is a small 5x5 grid of single characters; cap the
+	// request body well above that to block oversized-payload abuse.
+	e.Use(middleware.BodyLimit("64K"))
+
+	e.POST("/solutions", solutionsHandler, solutionsRateLimiterMiddleware())
+	e.GET("/status", statusHandler)
+
+	// Serve static files from the frontend build
+	e.Static("/", "static")
+
+	return e
+}
+
+func solutionsHandler(c echo.Context) error {
+	s := searcherState.Load()
+	if s == nil {
+		return echo.NewHTTPError(http.StatusServiceUnavailable, "Solutions are still being loaded. Please try again in a moment.")
+	}
+	var req BoardRequest
+	if err := c.Bind(&req); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "Invalid board format")
+	}
+	// Validate board dimensions
+	if len(req.Board) != 5 {
+		return echo.NewHTTPError(http.StatusBadRequest, "Board must be 5x5")
+	}
+	for _, row := range req.Board {
+		if len(row) != 5 {
+			return echo.NewHTTPError(http.StatusBadRequest, "Board must be 5x5")
+		}
+	}
+	if err := validateBoardCells(req.Board); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+	return streamSolutions(c, s, stringToRuneBoard(req.Board), 1000)
+}
+
+// Status endpoint to check if searcher is ready
+func statusHandler(c echo.Context) error {
+	s := searcherState.Load()
+	status := map[string]interface{}{
+		"ready": s != nil,
+	}
+	if s != nil {
+		status["solutions_count"] = len(s.GetSolutionSet().GetSolutions())
+	}
+	return c.JSON(http.StatusOK, status)
 }
 
 func main() {
@@ -57,63 +348,43 @@ func main() {
 		}
 	}()
 
-	e := echo.New()
+	e := newEcho()
 
-	// Enable CORS for frontend
-	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
-			c.Response().Header().Set("Access-Control-Allow-Origin", "*")
-			c.Response().Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			c.Response().Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	// Guard against slow/stalled clients holding connections open
+	// (e.g. slowloris-style attacks); net/http's zero-value timeouts are
+	// unbounded.
+	e.Server.ReadHeaderTimeout = readHeaderTimeout
+	e.Server.ReadTimeout = readTimeout
+	e.Server.WriteTimeout = writeTimeout
+	e.Server.IdleTimeout = idleTimeout
 
-			if c.Request().Method == "OPTIONS" {
-				return c.NoContent(http.StatusNoContent)
-			}
+	addr := listenAddr()
 
-			return next(c)
+	var startFn func() error
+	certFile := os.Getenv("TLS_CERT_FILE")
+	keyFile := os.Getenv("TLS_KEY_FILE")
+	if certFile != "" && keyFile != "" {
+		s, err := newTLSServer(e, addr, certFile, keyFile)
+		if err != nil {
+			e.Logger.Fatal(err)
 		}
-	})
+		startFn = func() error { return e.StartServer(s) }
+	} else {
+		log.Println("TLS_CERT_FILE/TLS_KEY_FILE not set; serving plain HTTP. Terminate TLS here or at a reverse proxy in production.")
+		startFn = func() error { return e.Start(addr) }
+	}
 
-	e.POST("/solutions", func(c echo.Context) error {
-		if !searcherReady {
-			return echo.NewHTTPError(http.StatusServiceUnavailable, "Solutions are still being loaded. Please try again in a moment.")
-		}
-		var req BoardRequest
-		if err := c.Bind(&req); err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "Invalid board format")
-		}
-		// Validate board dimensions
-		if len(req.Board) != 5 {
-			return echo.NewHTTPError(http.StatusBadRequest, "Board must be 5x5")
-		}
-		for _, row := range req.Board {
-			if len(row) != 5 {
-				return echo.NewHTTPError(http.StatusBadRequest, "Board must be 5x5")
-			}
-		}
-		return streamSolutions(c, stringToRuneBoard(req.Board), 1000)
-	})
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	// Status endpoint to check if searcher is ready
-	e.GET("/status", func(c echo.Context) error {
-		status := map[string]interface{}{
-			"ready": searcherReady,
-		}
-		if searcherReady {
-			status["solutions_count"] = len(searcher.GetSolutionSet().GetSolutions())
-		}
-		return c.JSON(http.StatusOK, status)
-	})
-
-	// Serve static files from the frontend build
-	e.Static("/", "static")
-
-	e.Logger.Fatal(e.Start(":1323"))
+	if err := runWithGracefulShutdown(ctx, e, startFn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		e.Logger.Fatal(err)
+	}
 }
 
-func gridFromSolutionIndex(idx int) [][]rune {
-	solution := searcher.GetSolutionSet().GetSolutions()[idx]
-	dictionary := searcher.GetSolutionSet().GetDictionary()
+func gridFromSolutionIndex(s *psolve.Searcher, idx int) [][]rune {
+	solution := s.GetSolutionSet().GetSolutions()[idx]
+	dictionary := s.GetSolutionSet().GetDictionary()
 	grid := make([][]rune, len(solution.GetWord()))
 	for i, row := range solution.GetWord() {
 		word := dictionary.GetWord()[row]
@@ -141,6 +412,43 @@ func runeToStringBoard(board [][]rune) [][]string {
 	return stringBoard
 }
 
+// isASCIILetter reports whether r is an ASCII letter (a-z, A-Z).
+// validateBoardCells checks this narrower set rather than unicode.IsLetter:
+// the word list/dictionary is entirely ASCII English text, and a non-ASCII
+// letter (e.g. 'ñ', a Cyrillic or CJK letter - all accepted by
+// unicode.IsLetter) has no entry in psolve.Searcher's alphabet map, so it
+// would silently resolve to alphabet component 0 - the same component
+// reserved for "empty cell" - via Go's map zero-value default (see
+// psolve/search.go's populateAlphabet). That's exactly the collision this
+// validation exists to prevent, so unicode.IsLetter was too permissive to
+// catch it. An ASCII letter that simply doesn't appear at a given
+// row/column in the current dictionary (e.g. "z" in a position no word
+// happens to use) is still accepted and correctly falls through to a
+// legitimate zero-match result - letter usage naturally varies by position
+// and isn't itself invalid input.
+func isASCIILetter(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+}
+
+// validateBoardCells rejects any board cell that isn't a blank marker ("" or
+// "_") or a single ASCII letter. Without this, stringToRuneBoard would
+// silently truncate multi-character cells to their first rune and pass
+// invalid runes straight through to the searcher.
+func validateBoardCells(board [][]string) error {
+	for i, row := range board {
+		for j, cell := range row {
+			if cell == "" || cell == "_" {
+				continue
+			}
+			runes := []rune(cell)
+			if len(runes) != 1 || !isASCIILetter(runes[0]) {
+				return fmt.Errorf("invalid cell at row %d, col %d: must be a single letter or empty", i, j)
+			}
+		}
+	}
+	return nil
+}
+
 func stringToRuneBoard(board [][]string) [][]rune {
 	runeBoard := make([][]rune, len(board))
 	for i, row := range board {
@@ -157,21 +465,31 @@ func stringToRuneBoard(board [][]string) [][]rune {
 	return runeBoard
 }
 
-func streamSolutions(c echo.Context, boardState [][]rune, limit int) error {
-	c.Response().Header().Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
-	c.Response().WriteHeader(http.StatusOK)
+func streamSolutions(c echo.Context, s *psolve.Searcher, boardState [][]rune, limit int) error {
 	// Generate solutions based on board state
 	ctx, cancel := context.WithTimeout(c.Request().Context(), time.Second*2)
 	defer cancel()
-	solutionChan, err := searcher.FindMatchingSolutions(ctx, boardState)
+	solutionChan, err := s.FindMatchingSolutions(ctx, boardState)
 	if err != nil {
-		fmt.Printf("Failed to find solutions: %v\n", err)
-		return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to find solutions: %v", err))
+		// Log the real error server-side for diagnosis, but don't echo
+		// internal search-index details (e.g. "no indexed solutions for
+		// key: ...") back to the client - a generic message is enough for
+		// callers, and avoids leaking implementation details of the
+		// indexing scheme to anyone probing the endpoint.
+		log.Printf("Failed to find solutions: %v", err)
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to find solutions")
 	}
+	// Only commit the response (and thus the 200 status) once the search
+	// has actually started successfully - writing the header before this
+	// point would commit a 200 before an error from FindMatchingSolutions
+	// is known, silently downgrading a real failure into what looks like a
+	// successful empty result to the client.
+	c.Response().Header().Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	c.Response().WriteHeader(http.StatusOK)
 	enc := json.NewEncoder(c.Response())
 	i := 0
 	for solutionIdx := range solutionChan {
-		grid := gridFromSolutionIndex(solutionIdx)
+		grid := gridFromSolutionIndex(s, solutionIdx)
 		solution := Solution{
 			ID:   i + 1,
 			Grid: runeToStringBoard(grid),

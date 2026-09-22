@@ -173,12 +173,25 @@ func (s *Searcher) noCopyIntersection(ctx context.Context, solutionSets []Soluti
 				// continue processing.
 			}
 			if s.solutionInSets(solution, solutionSets[1:]) {
-				solutionChan <- solution
+				select {
+				case <-ctx.Done():
+					fmt.Printf("noCopyIntersection canceled: %v\n", ctx.Err())
+					return
+				case solutionChan <- solution:
+				}
 			}
 		}
 	}(ctx)
 	return solutionChan
 }
+
+// noMatchesForKey is a shared empty SolutionSet used whenever a queried
+// key/keyVal has no entry in the index at all. That simply means no solution
+// contains that letter at that row/column - a normal "zero results" outcome
+// (e.g. the user typed a letter into a position no valid word square can
+// fill), not a search failure - so it's folded into the intersection like
+// any other (empty) constraint rather than treated as an error.
+var noMatchesForKey = SolutionSet{}
 
 func (s *Searcher) filterSolutionsByKey(ctx context.Context, keys map[int]int) (SolutionChan, error) {
 	solutionSets := []SolutionSet{}
@@ -186,11 +199,13 @@ func (s *Searcher) filterSolutionsByKey(ctx context.Context, keys map[int]int) (
 	for key, keyVal := range keys {
 		indexedSolutions, exists := s.keyIndexedSolutions[key]
 		if !exists {
-			return nil, fmt.Errorf("no indexed solutions for key: %s", s.keyString(key))
+			solutionSets = append(solutionSets, noMatchesForKey)
+			continue
 		}
 		matchingSolutions, exists := indexedSolutions[keyVal]
 		if !exists {
-			return nil, fmt.Errorf("no matching keyVal for key %s", s.keyString(key))
+			solutionSets = append(solutionSets, noMatchesForKey)
+			continue
 		}
 		solutionSets = append(solutionSets, matchingSolutions)
 	}
@@ -239,7 +254,12 @@ func (s *Searcher) filterSolutionsAbsolutely(ctx context.Context, solutions Solu
 			solutionSquare := s.ss.GetSolutions()[solution]
 			solutionGrid := gridFromProto(s.ss.GetDictionary(), solutionSquare)
 			if s.possibleMatch(solutionGrid, grid) {
-				c <- solution // Send solution if it matches the grid.
+				select {
+				case <-ctx.Done():
+					fmt.Printf("filterSolutionsAbsolutely canceled: %v\n", ctx.Err())
+					return
+				case c <- solution: // Send solution if it matches the grid.
+				}
 			}
 		}
 	}()

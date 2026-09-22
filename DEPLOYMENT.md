@@ -51,6 +51,85 @@ docker build -t wordcube:latest .
 docker run -p 1323:1323 wordcube:latest
 ```
 
+## Backend Security & Networking Configuration
+
+The Go server (`server/app/server.go`) reads the following environment variables to
+control its networking/security posture. All are optional; defaults are chosen to
+preserve existing dev/Codespaces behavior out of the box.
+
+- `PORT` - the TCP port the server listens on (plain HTTP or TLS, whichever is
+  active). Defaults to `1323`, matching the port `docker-compose.yml` maps and has
+  always set via this same env var. Falls back to the default with a logged warning
+  if set to something that isn't a valid port number (1-65535).
+- `ALLOWED_ORIGINS` - comma-separated list of origins allowed by CORS
+  (e.g. `https://wordcube.example.com,https://staging.wordcube.example.com`).
+  Defaults to `*` (all origins allowed), since the frontend may be served from an
+  arbitrary dev-environment URL. **Set this to your real frontend origin(s) in
+  production** rather than relying on the wildcard default.
+- `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` - per-client-IP token-bucket limits applied
+  to `POST /solutions` only (the one endpoint that runs a real search against the
+  in-memory index). Defaults to 5 requests/second with a burst of 10. Requests over
+  the limit receive HTTP 429.
+- `TRUST_PROXY_HEADERS` - set to `true` only if this server sits behind a trusted
+  reverse proxy that sets `X-Forwarded-For`. Defaults to `false`, meaning the
+  server (and the rate limiter above) identifies clients by the raw TCP connection
+  address only. **Do not set this unless you actually have a trusted proxy in
+  front of the container** - since neither `docker-compose.yml` nor the
+  `Dockerfile` in this repo add one by default, trusting these headers out of the
+  box would let any client bypass per-IP rate limiting by sending a different
+  `X-Forwarded-For` value on every request.
+- `TLS_CERT_FILE` / `TLS_KEY_FILE` - paths to a PEM certificate and private key. If
+  both are set, the server terminates TLS itself and listens with HTTPS on the
+  configured `PORT` instead of plain HTTP. The TLS config (`newTLSConfig` in
+  `server/app/server.go`) sets `MinVersion: tls.VersionTLS12` (rejecting the
+  deprecated, downgrade-prone TLS 1.0/1.1) and restricts `CipherSuites` to
+  AEAD-only suites (AES-GCM and ChaCha20-Poly1305), excluding the CBC-mode
+  suites Go's default TLS 1.2 cipher list otherwise allows for legacy-client
+  compatibility - this app has no such legacy client to support, so CBC (with
+  its history of padding-oracle/timing attacks) is disabled outright rather
+  than negotiated as a fallback. This restriction only affects TLS 1.2
+  negotiation; TLS 1.3 in Go always uses its own fixed AEAD suite set
+  regardless of `CipherSuites`. If unset (the default, including the current Docker/Compose setup),
+  the server serves plain HTTP and expects TLS to be terminated in front of it -
+  e.g. by a reverse proxy (nginx, Caddy, an ALB/Cloud Load Balancer, etc.) or a
+  platform that handles TLS for you. Neither `docker-compose.yml` nor the
+  `Dockerfile` in this repo currently set up such a proxy, so anyone deploying this
+  image directly on the open internet must either supply
+  `TLS_CERT_FILE`/`TLS_KEY_FILE` or put a TLS-terminating proxy in front of
+  container port `1323` (or whatever `PORT` is set to).
+
+These, along with connection timeouts, security headers (`X-Content-Type-Options`,
+`X-Frame-Options`, HSTS, `Referrer-Policy: no-referrer`, and a locked-down
+`Permissions-Policy` denying camera/microphone/geolocation/payment/usb/FLoC), a 64K
+request body limit, and panic recovery, are covered by the test suite in
+`server/app/server_test.go`.
+
+### Content-Security-Policy
+
+The server also sends a fixed `Content-Security-Policy` header (not configurable via
+env var, since it's tuned to this specific frontend build rather than being a
+per-deployment operational setting):
+
+```
+default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
+img-src 'self' data:; connect-src 'self'; base-uri 'self'; form-action 'self';
+frame-ancestors 'none'
+```
+
+This assumes the standard deployment shape where the Go server serves both the API
+and the built frontend from the same origin (`e.Static("/", "static")` in
+`server/app/server.go`, populated by the Docker build) - `'self'` covers both. If
+you ever serve the frontend from a different origin than the API, `connect-src` will
+need to include that API origin explicitly, or the frontend's `fetch` calls will be
+blocked by the browser.
+
+`style-src` needs `'unsafe-inline'` because the shadcn/Radix UI components in
+`site/src/components/ui` set inline `style` attributes at runtime for positioning
+(popovers, dropdowns, etc.) - confirmed by loading the built frontend in a real
+Chromium instance and checking for CSP violation reports. `script-src` has no such
+need and stays strict (`'self'` only), so injected/inline `<script>` execution is
+still blocked.
+
 ## Application Structure
 
 - **Frontend**: React application built with Vite (in `site/` directory)
@@ -66,19 +145,22 @@ The Dockerfile uses a multi-stage build process:
    - Runs `npm run build` to create production assets
 
 2. **Stage 2**: Builds the Go server binary
-   - Uses Go 1.24
+   - Uses Go 1.25
    - Compiles the server from `server/app/server.go`
 
 3. **Stage 3**: Creates final lightweight Alpine Linux image
    - Copies the built Go binary
    - Copies frontend build assets to `static/` directory
    - Copies required data files
+   - Runs as an unprivileged `wordcube` user (not root) - the app binds to
+     port 1323, which doesn't require root, and never writes to disk at
+     runtime, so there's no reason to run it with root privileges
    - Exposes port 1323
 
 ## API Endpoints
 
-- `GET /solutions` - Get solutions for an empty board
-- `POST /solutions` - Get solutions for a specific board state
+- `POST /solutions` - Streams matching solutions (NDJSON) for a given board state
+- `GET /status` - Readiness check and precomputed solution count
 - `GET /` - Serves the frontend application
 
 ## Environment

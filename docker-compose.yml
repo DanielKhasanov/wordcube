@@ -9,4 +9,19 @@ services:
       - "1323:1323"
     environment:
       - PORT=1323
+      # Lock CORS down to your real frontend origin(s) in production;
+      # defaults to "*" if unset. See DEPLOYMENT.md.
+      # - ALLOWED_ORIGINS=https://wordcube.example.com
+      # Per-IP rate limit for POST /solutions; defaults to 5 rps / burst 10.
+      # - RATE_LIMIT_RPS=5
+      # - RATE_LIMIT_BURST=10
+      # Only set this if you add a trusted reverse proxy in front of this
+      # container; it makes the server (and the rate limiter above) trust
+      # X-Forwarded-For instead of the raw connection address. Leave unset
+      # otherwise, or any client can bypass rate limiting by spoofing it.
+      # - TRUST_PROXY_HEADERS=true
+      # Set both to have the server terminate TLS itself instead of relying
+      # on a reverse proxy in front of it.
+      # - TLS_CERT_FILE=/certs/tls.crt
+      # - TLS_KEY_FILE=/certs/tls.key
     restart: unless-stopped
