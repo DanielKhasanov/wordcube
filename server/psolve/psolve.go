@@ -70,7 +70,7 @@ func (i Indexes) Values() iter.Seq[int] {
 type State struct {
 	size          int
 	validWords    [][]rune
-	verticalTries []*trie.Trie
+	verticalTries []trie.Walker
 	// rowWordIndexes[i] = j -> The word at row i is validWords[j]. i > currentRow -> j = 0.
 	rowWordIndexes Indexes
 	// index of largest populated row.
@@ -129,27 +129,27 @@ func (s *State) buildFromWords(words []string) error {
 	s.rowWordIndexes = NewIndexes(size)
 	s.startRowWordIndexes = NewIndexes(size)
 	s.endRowWordIndexes = NewIndexes(size)
-	for i := range size {
-		verticalTrie, err := trie.NewTrie(size)
-		if err != nil {
-			return fmt.Errorf("error creating trie: %v", err)
-		}
-		s.verticalTries = append(s.verticalTries, verticalTrie)
-		s.rowWordIndexes.Emplace(i, 0)
-		s.startRowWordIndexes.Emplace(i, 0)
-		s.endRowWordIndexes.Emplace(i, len(words)-1)
+	// Every column draws from the same word list, so a single shared Trie
+	// captures the graph for all of them; each column just needs its own
+	// independent Walker over that shared graph.
+	columnTrie, err := trie.NewTrie(size)
+	if err != nil {
+		return fmt.Errorf("error creating trie: %v", err)
 	}
 	for i, word := range words {
 		s.validWords[i] = []rune(word)
 		if len(word) != size {
 			return fmt.Errorf("word lengths should be equal, size=%d, wordlen=%d word=%s", size, len(word), word)
 		}
-		for _, t := range s.verticalTries {
-			err := t.Insert(word)
-			if err != nil {
-				return fmt.Errorf("error inserting word %s: %v", word, err)
-			}
+		if err := columnTrie.Insert(word); err != nil {
+			return fmt.Errorf("error inserting word %s: %v", word, err)
 		}
+	}
+	for i := range size {
+		s.verticalTries = append(s.verticalTries, columnTrie.NewWalker())
+		s.rowWordIndexes.Emplace(i, 0)
+		s.startRowWordIndexes.Emplace(i, 0)
+		s.endRowWordIndexes.Emplace(i, len(words)-1)
 	}
 	s.prefixSkipList = buildPrefixSkipList(s.validWords)
 	return nil
